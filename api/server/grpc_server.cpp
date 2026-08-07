@@ -124,6 +124,7 @@ Status FromProtoRequest(const pb::GenerateRequest& proto,
     for (const std::string& s : gen.stop()) {
         out.stop_sequences.push_back(s);
     }
+    out.allow_prefix_cache = proto.cache().allow_prefix_cache();
     return Status::Ok();
 }
 

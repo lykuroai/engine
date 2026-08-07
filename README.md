@@ -104,8 +104,14 @@ artifact 化し、HF transformers FP32 を oracle として照合
   最適化前(fp32 weight + cuBLAS SGEMV、逐次 prefill、単純 attention)
   は decode 約 18 tok/s、TTFT 85 ms(18 tok)、ctx 1289 で 58 tok/s。
   数値は §25.3 の完全な benchmark(soak / saturation)を経ていないため
-  certified profile としては未発行。paged KV・prefix cache・量子化は
-  今後の Phase 4 継続項目。
+  certified profile としては未発行。
+
+  **Paged KV / prefix cache(§16.3)実装済み**: 64 token block pool +
+  per-sequence block table(物理割当はオンデマンド、sequence あたりの
+  事前確保を撤廃)。prefix cache は request の `allow_prefix_cache`
+  opt-in(既定 OFF、§16.2)で、chain hash は tenant/project scope を
+  seed に含むため cross-scope 再利用は構造的に不可能(§16.1)。
+  refcount + LRU eviction。残る Phase 4 項目は INT8/INT4 量子化。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。

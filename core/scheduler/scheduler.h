@@ -27,6 +27,7 @@ struct ScheduledRequest {
     uint32_t max_output_tokens = 0;
     SamplingParams sampling;
     std::vector<std::string> stop_sequences;
+    bool allow_prefix_cache = false;
 };
 
 struct SchedulerConfig {

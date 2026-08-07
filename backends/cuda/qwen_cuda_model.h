@@ -19,6 +19,14 @@ namespace lykuro::nie {
 // / SwiGLU. All math in FP32 (BF16/FP16 weights are widened at load).
 // Outputs must match the CPU reference within certified tolerance; the
 // parity test enforces this on real hardware.
+struct CudaModelOptions {
+    int device_id = 0;
+    // Total KV pool capacity in tokens (0 = default: 4x max context) and
+    // the paged-block granularity (spec §16.3 block allocator).
+    uint32_t kv_pool_tokens = 0;
+    uint32_t kv_block_tokens = 64;
+};
+
 class QwenCudaModel : public GenerativeModel {
 public:
     struct LoadResult {
@@ -30,6 +38,9 @@ public:
     // gpu_unhealthy) without partial residency.
     static LoadResult Load(const ModelManifest& manifest,
                            const SafetensorsFile& weights, int device_id);
+    static LoadResult Load(const ModelManifest& manifest,
+                           const SafetensorsFile& weights,
+                           const CudaModelOptions& options);
 
     ~QwenCudaModel() override;
     QwenCudaModel(const QwenCudaModel&) = delete;
@@ -47,7 +58,15 @@ public:
     Status DecodeBatch(std::vector<DecodeBatchItem>& items,
                        std::vector<Status>& per_item) override;
 
+    Status CreateSequenceEx(uint32_t max_tokens, const SequenceOptions&,
+                            std::unique_ptr<SequenceState>& out) override;
+
     const QwenConfig& config() const { return config_; }
+
+    // Paged-KV / prefix-cache introspection (tests, capacity metrics).
+    uint32_t kv_blocks_total() const;
+    uint32_t kv_blocks_free() const;
+    uint64_t prefix_cache_hit_tokens() const;
 
 private:
     QwenCudaModel() = default;

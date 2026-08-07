@@ -145,6 +145,7 @@ InferenceEngine::SubmitResult InferenceEngine::SubmitImpl(
     scheduled.max_output_tokens = request.max_output_tokens;
     scheduled.sampling = request.sampling;
     scheduled.stop_sequences = request.stop_sequences;
+    scheduled.allow_prefix_cache = request.allow_prefix_cache;
 
     result.status = QwenChatTemplate::BuildPrompt(
         *tokenizer_, request.messages, scheduled.prompt_tokens);
@@ -374,8 +375,12 @@ void InferenceEngine::AdmitPending(int64_t now) {
         ActiveSequence seq;
         seq.request = std::move(next);
         seq.channel = channel;
-        Status create = model_->CreateSequence(
-            model_->limits().max_context_tokens, seq.state);
+        SequenceOptions seq_options;
+        seq_options.allow_prefix_cache = seq.request->allow_prefix_cache;
+        seq_options.scope_key = seq.request->tenant_scope + "/" +
+                                seq.request->project_scope;
+        Status create = model_->CreateSequenceEx(
+            model_->limits().max_context_tokens, seq_options, seq.state);
         seq.sampler = std::make_unique<Sampler>(seq.request->sampling);
         seq.stop_matcher =
             std::make_unique<StopMatcher>(seq.request->stop_sequences);

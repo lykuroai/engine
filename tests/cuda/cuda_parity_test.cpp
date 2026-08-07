@@ -93,6 +93,21 @@ TEST_F(CudaParityTest, PrefillLogitsMatchCpuReference) {
     ExpectClose(cpu_logits, cuda_logits, 1e-3f, "prefill logits");
 }
 
+// Long prompt (> the batched-decode staging width): regression anchor for
+// the chunked-prefill KV staging overflow found during the paged-KV work.
+TEST_F(CudaParityTest, LongPromptPrefillMatchesCpuReference) {
+    std::vector<uint32_t> prompt;
+    for (uint32_t i = 0; i < 60; ++i) prompt.push_back(1 + i * 5 % 300);
+    std::unique_ptr<SequenceState> cpu_state, cuda_state;
+    ASSERT_TRUE(cpu_->CreateSequence(128, cpu_state).ok());
+    ASSERT_TRUE(cuda_->CreateSequence(128, cuda_state).ok());
+
+    std::vector<float> cpu_logits, cuda_logits;
+    ASSERT_TRUE(cpu_->Prefill(*cpu_state, prompt, cpu_logits).ok());
+    ASSERT_TRUE(cuda_->Prefill(*cuda_state, prompt, cuda_logits).ok());
+    ExpectClose(cpu_logits, cuda_logits, 1e-3f, "long prompt logits");
+}
+
 TEST_F(CudaParityTest, DecodeTrajectoryMatchesCpuReference) {
     const std::vector<uint32_t> prompt = {3, 7, 11};
     std::unique_ptr<SequenceState> cpu_state, cuda_state;
@@ -257,6 +272,150 @@ TEST_F(CudaParityTest, BatchedDecodeIsolatesInvalidItems) {
     EXPECT_TRUE(per_item[0].ok());
     EXPECT_EQ(per_item[1].code(), ErrorCode::kContextLengthExceeded);
     EXPECT_EQ(per_item[2].code(), ErrorCode::kInvalidRequest);
+}
+
+// ---- paged KV / prefix cache (spec §16.3) ----
+
+TEST_F(CudaParityTest, PagedPoolExhaustionReportsCapacity) {
+    testutil::TinyModelSpec spec;
+    spec.vocab_size = 303;
+    spec.eos_token_id = 302;
+    spec.max_context_tokens = 128;
+    CudaModelOptions options;
+    options.device_id = TestDevice();
+    options.kv_pool_tokens = 32;  // 2 blocks of 16
+    options.kv_block_tokens = 16;
+    auto small = QwenCudaModel::Load(manifest_, file_, options);
+    ASSERT_TRUE(small.status.ok()) << small.status.message();
+
+    std::unique_ptr<SequenceState> state;
+    ASSERT_TRUE(small.model->CreateSequence(128, state).ok());
+    std::vector<float> logits;
+    // 40 tokens need 3 blocks; the pool only has 2.
+    std::vector<uint32_t> prompt(40, 1);
+    Status s = small.model->Prefill(*state, prompt, logits);
+    EXPECT_FALSE(s.ok());
+    EXPECT_EQ(s.code(), ErrorCode::kCapacityExhausted);
+
+    // Releasing the sequence returns its blocks to the pool.
+    state.reset();
+    EXPECT_EQ(small.model->kv_blocks_free(),
+              small.model->kv_blocks_total());
+}
+
+TEST_F(CudaParityTest, PrefixCacheReusesBlocksWithinScope) {
+    testutil::TinyModelSpec spec;
+    spec.vocab_size = 303;
+    spec.eos_token_id = 302;
+    spec.max_context_tokens = 128;
+    CudaModelOptions options;
+    options.device_id = TestDevice();
+    options.kv_pool_tokens = 512;
+    options.kv_block_tokens = 16;
+    auto model = QwenCudaModel::Load(manifest_, file_, options);
+    ASSERT_TRUE(model.status.ok());
+
+    // 40-token prompt: blocks 0,1 (32 tokens) are cacheable full blocks.
+    std::vector<uint32_t> prompt;
+    for (uint32_t i = 0; i < 40; ++i) prompt.push_back(1 + i % 250);
+    SequenceOptions seq_options;
+    seq_options.allow_prefix_cache = true;
+    seq_options.scope_key = "tn_a/prj_1";
+
+    std::unique_ptr<SequenceState> first;
+    ASSERT_TRUE(model.model->CreateSequenceEx(128, seq_options, first).ok());
+    std::vector<float> logits_first;
+    ASSERT_TRUE(model.model->Prefill(*first, prompt, logits_first).ok());
+    EXPECT_EQ(model.model->prefix_cache_hit_tokens(), 0u);
+
+    // Same prompt, same scope: two blocks (32 tokens) come from cache and
+    // the logits are identical (deterministic kernels).
+    std::unique_ptr<SequenceState> second;
+    ASSERT_TRUE(
+        model.model->CreateSequenceEx(128, seq_options, second).ok());
+    std::vector<float> logits_second;
+    ASSERT_TRUE(model.model->Prefill(*second, prompt, logits_second).ok());
+    EXPECT_EQ(model.model->prefix_cache_hit_tokens(), 32u);
+    EXPECT_EQ(logits_first, logits_second);
+    const std::vector<float> pristine_prefill_logits = logits_first;
+
+    // Decode continues identically after a cached prefill.
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    Sampler s1(greedy), s2(greedy);
+    for (int step = 0; step < 8; ++step) {
+        uint32_t t1 = 0, t2 = 0;
+        ASSERT_TRUE(s1.Sample(logits_first, t1).ok());
+        ASSERT_TRUE(s2.Sample(logits_second, t2).ok());
+        ASSERT_EQ(t1, t2);
+        ASSERT_TRUE(model.model->Decode(*first, t1, logits_first).ok());
+        ASSERT_TRUE(model.model->Decode(*second, t2, logits_second).ok());
+    }
+
+    // Different scope: no reuse (spec §16.1 isolation).
+    SequenceOptions other_scope;
+    other_scope.allow_prefix_cache = true;
+    other_scope.scope_key = "tn_b/prj_9";
+    std::unique_ptr<SequenceState> third;
+    ASSERT_TRUE(
+        model.model->CreateSequenceEx(128, other_scope, third).ok());
+    std::vector<float> logits_third;
+    ASSERT_TRUE(model.model->Prefill(*third, prompt, logits_third).ok());
+    EXPECT_EQ(model.model->prefix_cache_hit_tokens(), 32u);  // unchanged
+    EXPECT_EQ(pristine_prefill_logits, logits_third);  // same math, no sharing
+}
+
+TEST_F(CudaParityTest, PrefixCacheDisabledByDefault) {
+    testutil::TinyModelSpec spec;
+    CudaModelOptions options;
+    options.device_id = TestDevice();
+    options.kv_pool_tokens = 512;
+    options.kv_block_tokens = 16;
+    auto model = QwenCudaModel::Load(manifest_, file_, options);
+    ASSERT_TRUE(model.status.ok());
+
+    std::vector<uint32_t> prompt(40, 7);
+    for (int round = 0; round < 2; ++round) {
+        std::unique_ptr<SequenceState> state;
+        ASSERT_TRUE(model.model->CreateSequence(128, state).ok());
+        std::vector<float> logits;
+        ASSERT_TRUE(model.model->Prefill(*state, prompt, logits).ok());
+    }
+    EXPECT_EQ(model.model->prefix_cache_hit_tokens(), 0u);
+}
+
+TEST_F(CudaParityTest, PrefixCacheEvictionReclaimsUnreferencedBlocks) {
+    testutil::TinyModelSpec spec;
+    CudaModelOptions options;
+    options.device_id = TestDevice();
+    options.kv_pool_tokens = 64;  // 4 blocks of 16
+    options.kv_block_tokens = 16;
+    auto model = QwenCudaModel::Load(manifest_, file_, options);
+    ASSERT_TRUE(model.status.ok());
+
+    SequenceOptions seq_options;
+    seq_options.allow_prefix_cache = true;
+    seq_options.scope_key = "tn_a";
+
+    // Prompt A fills + registers 2 full blocks, then the sequence ends
+    // (blocks stay cached with refcount 0).
+    {
+        std::vector<uint32_t> prompt_a(40, 3);
+        std::unique_ptr<SequenceState> a;
+        ASSERT_TRUE(model.model->CreateSequenceEx(128, seq_options, a).ok());
+        std::vector<float> logits;
+        ASSERT_TRUE(model.model->Prefill(*a, prompt_a, logits).ok());
+    }
+    EXPECT_EQ(model.model->kv_blocks_free(), model.model->kv_blocks_total());
+
+    // Prompt B needs 3 blocks; eviction reclaims A's cached blocks.
+    {
+        std::vector<uint32_t> prompt_b(48, 9);
+        std::unique_ptr<SequenceState> b;
+        ASSERT_TRUE(model.model->CreateSequenceEx(128, seq_options, b).ok());
+        std::vector<float> logits;
+        ASSERT_TRUE(model.model->Prefill(*b, prompt_b, logits).ok());
+    }
 }
 
 // Not a certified benchmark (tiny random model): records rough

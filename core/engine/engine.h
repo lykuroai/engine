@@ -48,6 +48,8 @@ struct InferenceRequest {
     uint32_t max_output_tokens = 0;
     SamplingParams sampling;
     std::vector<std::string> stop_sequences;
+    // KV prefix reuse is opt-in per request (spec §16.2 default OFF).
+    bool allow_prefix_cache = false;
 };
 
 enum class RequestState {

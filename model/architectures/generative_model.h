@@ -29,6 +29,14 @@ struct ModelLimits {
     std::vector<uint32_t> eos_token_ids;
 };
 
+// Per-sequence options (spec §16). Prefix reuse is opt-in per request and
+// scoped: sequences with different scope keys can never share cache
+// content (spec §16.1 cross-scope reuse ban).
+struct SequenceOptions {
+    bool allow_prefix_cache = false;
+    std::string scope_key;  // e.g. tenant/project hash
+};
+
 class GenerativeModel {
 public:
     virtual ~GenerativeModel() = default;
@@ -38,6 +46,14 @@ public:
     // Allocates a sequence with room for `max_tokens` positions.
     virtual Status CreateSequence(uint32_t max_tokens,
                                   std::unique_ptr<SequenceState>& out) = 0;
+
+    // CreateSequence with options; backends without prefix caching ignore
+    // them (the CPU reference does).
+    virtual Status CreateSequenceEx(uint32_t max_tokens,
+                                    const SequenceOptions&,
+                                    std::unique_ptr<SequenceState>& out) {
+        return CreateSequence(max_tokens, out);
+    }
 
     // Runs the prompt, filling the sequence state; returns last-position
     // logits (host FP32). Non-finite logits fail with inference_failed.
