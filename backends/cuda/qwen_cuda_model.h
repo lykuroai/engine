@@ -80,10 +80,11 @@ public:
     uint32_t kv_blocks_free() const;
     uint64_t prefix_cache_hit_tokens() const;
 
+    // Backend-internal state; nameable by file-local helpers in the .cu.
+    struct Impl;
+
 private:
     QwenCudaModel() = default;
-
-    struct Impl;
     Status ForwardToken(uint32_t token, uint32_t pos, void* sequence_state,
                         std::vector<float>& logits_out, bool want_logits);
     // Batched prefill over a chunk of prompt tokens (GEMM path).

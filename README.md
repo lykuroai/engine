@@ -139,8 +139,24 @@ artifact 化し、HF transformers FP32 を oracle として照合
   作業は約 290 launch → memcpy 3 回 + graph launch 1 回に削減され、
   engine スレッドの CPU 余力は大幅改善)。次の速度改善は kernel fusion。
 
-  Phase 4 主要項目は以上で完了。今後: kernel fusion、offline 量子化
-  (artifact pipeline + 品質評価)、§25.3 完全 benchmark。
+  **Kernel fusion(decode、batch ≤ 8)実装済み**: QKV 3 projection を
+  1 launch に融合(RMSNorm は per-sequence scale の事前計算 + 積み込み
+  fold)、gate/up/SwiGLU を 1 カーネル化、residual add を projection
+  epilogue に融合、RoPE q+k / K+V scatter 統合、head へ final norm
+  fold。依存チェーンは ~18 → ~10 kernels/layer。実測(RTX 3060):
+
+  | batch | fusion 前 | fusion 後 |
+  |---:|---:|---:|
+  | 1 | 153 | **169**(+10%) |
+  | 2 | 182 | **242**(+33%) |
+  | 8 | 286 | **335**(+17%) |
+  | ctx1289 (b1) | 138 | **150**(+8%) |
+
+  int8 も 171 tok/s と bf16 超え(チェーン短縮で帯域削減が発現)。
+
+  Phase 4 主要項目は以上で完了。今後: offline 量子化(artifact
+  pipeline + 品質評価)、§25.3 完全 benchmark、bucket16 GEMM 経路の
+  fusion 適用。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。

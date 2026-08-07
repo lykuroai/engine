@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <type_traits>
+#include <typeinfo>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -527,7 +529,251 @@ __global__ void MatVecBatchKernel(W weight, const float* __restrict__ x,
     }
 }
 
+
+// ---- fused decode kernels (Phase 4 kernel fusion, batch <= 8) ----
+//
+// The decode dependency chain is execution-latency bound, so the lever is
+// fewer kernels: RMSNorm folds into projections as a precomputed
+// per-sequence scale, Q/K/V share one launch, gate/up/SwiGLU collapse to
+// one kernel, and residual adds ride the projection epilogue. All sums
+// keep a fixed order (deterministic); the norm fold regroups
+// multiplications only.
+
+// Per-row inverse RMS: scales[row] = rsqrt(mean(x^2) + eps).
+__global__ void NormScaleKernel(const float* __restrict__ x, float eps,
+                                int dim, float* __restrict__ scales) {
+    __shared__ float partial[256];
+    const float* xr = x + size_t(blockIdx.x) * dim;
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        local += xr[i] * xr[i];
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scales[blockIdx.x] = rsqrtf(partial[0] / float(dim) + eps);
+    }
+}
+
+// One launch for Q, K and V: grid rows cover q_dim + 2*kv_dim, each block
+// picks its matrix segment. Norm is folded: acc = sum w * (x * norm_w),
+// scaled by the per-sequence inverse RMS at the epilogue.
+template <typename W, int B>
+__global__ void FusedQkvKernel(
+    W qw, W kw, W vw, const float* __restrict__ q_bias,
+    const float* __restrict__ k_bias, const float* __restrict__ v_bias,
+    const float* __restrict__ x, const float* __restrict__ norm_w,
+    const float* __restrict__ scales, int in_dim, int q_dim, int kv_dim,
+    float* __restrict__ q_out, float* __restrict__ k_out,
+    float* __restrict__ v_out) {
+    __shared__ float red[128];
+    const int row = blockIdx.x;
+    W w = qw;
+    const float* bias = q_bias;
+    float* dst = q_out;
+    int ld = q_dim;
+    size_t local = row;
+    if (row >= q_dim + kv_dim) {
+        w = vw;
+        bias = v_bias;
+        dst = v_out;
+        ld = kv_dim;
+        local = row - q_dim - kv_dim;
+    } else if (row >= q_dim) {
+        w = kw;
+        bias = k_bias;
+        dst = k_out;
+        ld = kv_dim;
+        local = row - q_dim;
+    }
+
+    float acc[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float wv = w.Load(local, i);
+        const float nw = norm_w[i];
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            acc[b] += wv * (x[size_t(b) * in_dim + i] * nw);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        red[threadIdx.x] = acc[b];
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] += red[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            dst[size_t(b) * ld + local] =
+                red[0] * scales[b] + bias[local];
+        }
+        __syncthreads();
+    }
+}
+
+// gate/up/SwiGLU in one kernel: each block computes the gate and up dot
+// products for its row and writes silu(gate) * up directly.
+template <typename W, int B>
+__global__ void FusedGateUpSwigluKernel(
+    W gate_w, W up_w, const float* __restrict__ x,
+    const float* __restrict__ norm_w, const float* __restrict__ scales,
+    int in_dim, float* __restrict__ out, int inter) {
+    __shared__ float red[128];
+    const size_t row = blockIdx.x;
+    float accg[B];
+    float accu[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        accg[b] = 0.0f;
+        accu[b] = 0.0f;
+    }
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float gw = gate_w.Load(row, i);
+        const float uw = up_w.Load(row, i);
+        const float nw = norm_w[i];
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            const float xn = x[size_t(b) * in_dim + i] * nw;
+            accg[b] += gw * xn;
+            accu[b] += uw * xn;
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        red[threadIdx.x] = accg[b];
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] += red[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        const float g = red[0] * scales[b];
+        __syncthreads();
+        red[threadIdx.x] = accu[b];
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] += red[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float u = red[0] * scales[b];
+            const float silu = g / (1.0f + expf(-g));
+            out[size_t(b) * inter + row] = silu * u;
+        }
+        __syncthreads();
+    }
+}
+
+// Batched GEMV with a fused epilogue: optional residual accumulation and
+// optional folded norm (head projection).
+template <typename W, int B, bool Accumulate, bool FoldNorm>
+__global__ void MatVecEpilogueKernel(
+    W w, const float* __restrict__ x, const float* __restrict__ norm_w,
+    const float* __restrict__ scales, int in_dim, float* __restrict__ y,
+    int ldy) {
+    __shared__ float red[128];
+    const size_t row = blockIdx.x;
+    float acc[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float wv = w.Load(row, i);
+        const float nw = FoldNorm ? norm_w[i] : 1.0f;
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            acc[b] += wv * (x[size_t(b) * in_dim + i] * nw);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        red[threadIdx.x] = acc[b];
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] += red[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float r = red[0];
+            if (FoldNorm) r *= scales[b];
+            if (Accumulate) {
+                y[size_t(b) * ldy + row] += r;
+            } else {
+                y[size_t(b) * ldy + row] = r;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// RoPE for Q and K in one launch: grid.x covers query heads then KV heads.
+__global__ void RopeQkKernel(float* __restrict__ q, float* __restrict__ k,
+                             int num_heads, int num_kv_heads, int head_dim,
+                             const uint32_t* __restrict__ positions,
+                             float theta) {
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int half = head_dim / 2;
+    float* h;
+    if (head < num_heads) {
+        h = q + size_t(row) * num_heads * head_dim + head * head_dim;
+    } else {
+        h = k + size_t(row) * num_kv_heads * head_dim +
+            (head - num_heads) * head_dim;
+    }
+    const uint32_t pos = positions[row];
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = powf(theta, -2.0f * float(i) / float(head_dim));
+        float angle = float(pos) * freq;
+        float c = cosf(angle);
+        float sn = sinf(angle);
+        float a = h[i];
+        float bb = h[i + half];
+        h[i] = a * c - bb * sn;
+        h[i + half] = bb * c + a * sn;
+    }
+}
+
+// K and V scatter in one launch.
+__global__ void ScatterKv2Kernel(const float* __restrict__ ksrc,
+                                 const float* __restrict__ vsrc,
+                                 float* __restrict__ kpool,
+                                 float* __restrict__ vpool,
+                                 const int* const* __restrict__ tables,
+                                 const uint32_t* __restrict__ positions,
+                                 int block_tokens, int kv_dim) {
+    const int row = blockIdx.x;
+    const int* table = tables[row];
+    const int t = int(positions[row]);
+    const size_t off = (size_t(table[t / block_tokens]) * block_tokens +
+                        (t % block_tokens)) *
+                       kv_dim;
+    for (int i = threadIdx.x; i < 2 * kv_dim; i += blockDim.x) {
+        if (i < kv_dim) {
+            kpool[off + i] = ksrc[size_t(row) * kv_dim + i];
+        } else {
+            vpool[off + i - kv_dim] = vsrc[size_t(row) * kv_dim + i - kv_dim];
+        }
+    }
+}
+
 // ---- batched prefill kernels ----
+
 
 constexpr int kChunk = 128;
 constexpr int kGemmTile = 16;
@@ -956,6 +1202,66 @@ void LaunchMatVecBatch(const float* x, const WeightBuffer& w,
     });
 }
 
+template <int B>
+void LaunchFusedQkvB(const WeightBuffer& qw, const WeightBuffer& kw,
+                     const WeightBuffer& vw, const float* q_bias,
+                     const float* k_bias, const float* v_bias,
+                     const float* x, const float* norm_w,
+                     const float* scales, int in_dim, int q_dim,
+                     int kv_dim, float* q_out, float* k_out, float* v_out,
+                     cudaStream_t stream) {
+    const int rows = q_dim + 2 * kv_dim;
+    WithWeightView(qw, in_dim, [&](auto qv) {
+        WithWeightView(kw, in_dim, [&](auto kv) {
+            WithWeightView(vw, in_dim, [&](auto vv) {
+                // decltype through by-reference lambda captures yields
+                // reference types; decay before comparing/instantiating.
+                using QT = std::decay_t<decltype(qv)>;
+                using KT = std::decay_t<decltype(kv)>;
+                using VT = std::decay_t<decltype(vv)>;
+                if constexpr (std::is_same_v<QT, KT> &&
+                              std::is_same_v<KT, VT>) {
+                    FusedQkvKernel<QT, B><<<rows, 128, 0, stream>>>(
+                        qv, kv, vv, q_bias, k_bias, v_bias, x, norm_w,
+                        scales, in_dim, q_dim, kv_dim, q_out, k_out,
+                        v_out);
+                }
+            });
+        });
+    });
+}
+
+template <int B>
+void LaunchFusedGateUpB(const WeightBuffer& gate_w,
+                        const WeightBuffer& up_w, const float* x,
+                        const float* norm_w, const float* scales,
+                        int in_dim, float* out, int inter,
+                        cudaStream_t stream) {
+    WithWeightView(gate_w, in_dim, [&](auto gv) {
+        WithWeightView(up_w, in_dim, [&](auto uv) {
+            using GT = std::decay_t<decltype(gv)>;
+            using UT = std::decay_t<decltype(uv)>;
+            if constexpr (std::is_same_v<GT, UT>) {
+                FusedGateUpSwigluKernel<GT, B>
+                    <<<inter, 128, 0, stream>>>(gv, uv, x, norm_w, scales,
+                                                in_dim, out, inter);
+            }
+        });
+    });
+}
+
+template <int B, bool Accumulate, bool FoldNorm>
+void LaunchMatVecEpiB(const WeightBuffer& w, const float* x,
+                      const float* norm_w, const float* scales, int in_dim,
+                      int out_dim, float* y, int ldy,
+                      cudaStream_t stream) {
+    WithWeightView(w, in_dim, [&](auto view) {
+        MatVecEpilogueKernel<decltype(view), B, Accumulate, FoldNorm>
+            <<<out_dim, 128, 0, stream>>>(view, x, norm_w, scales, in_dim,
+                                          y, ldy);
+    });
+}
+
 void LaunchGemm(const float* x, const WeightBuffer& w, const float* bias,
                 int n, int in_dim, int out_dim, float* c, int ldc,
                 cudaStream_t stream = nullptr) {
@@ -1124,6 +1430,7 @@ struct QwenCudaModel::Impl {
     bool chunked_prefill = false;
 
     DeviceBuffer d_positions;
+    DeviceBuffer d_norm_scales;  // [kMaxBatch] fused-path inverse RMS
     DeviceBuffer d_seq_tables;  // [kMaxBatch] const int*
     DeviceBuffer kv_k_rows, kv_v_rows;
     DeviceBuffer batch_logits;
@@ -1150,6 +1457,97 @@ struct QwenCudaModel::Impl {
 };
 
 namespace {
+
+// Fused decode graph body for batch <= 8 (see the fused-kernel section):
+// ~10 kernels per layer instead of ~18 on the dependency chain.
+template <int B>
+void RunFusedDecode(QwenCudaModel::Impl& impl, const QwenConfig& c,
+                    const uint32_t* positions_dev,
+                    const int* const* tables_dev, int splits,
+                    cudaStream_t stream) {
+    const int h = int(c.hidden_size);
+    const int q_dim = int(c.num_heads * c.head_dim);
+    const int kv_dim = int(c.num_kv_heads * c.head_dim);
+    const int group = int(c.num_heads / c.num_kv_heads);
+    const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
+    const int threads = 256;
+
+    if (impl.embed.bf16) {
+        GatherEmbedRowsKernel<__nv_bfloat16><<<B, threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(impl.embed.buf.ptr),
+            static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+            impl.x_rows.f32());
+    } else {
+        GatherEmbedRowsKernel<float><<<B, threads, 0, stream>>>(
+            static_cast<const float*>(impl.embed.buf.ptr),
+            static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+            impl.x_rows.f32());
+    }
+
+    for (uint32_t l = 0; l < c.num_layers; ++l) {
+        QwenCudaModel::Impl::Layer& layer = impl.layers[l];
+        NormScaleKernel<<<B, 256, 0, stream>>>(
+            impl.x_rows.f32(), c.rms_norm_eps, h,
+            impl.d_norm_scales.f32());
+        LaunchFusedQkvB<B>(layer.q_w, layer.k_w, layer.v_w,
+                           layer.q_b.f32(), layer.k_b.f32(),
+                           layer.v_b.f32(), impl.x_rows.f32(),
+                           layer.input_norm.f32(),
+                           impl.d_norm_scales.f32(), h, q_dim, kv_dim,
+                           impl.q_rows.f32(), impl.kv_k_rows.f32(),
+                           impl.kv_v_rows.f32(), stream);
+        {
+            dim3 grid_rope(c.num_heads + c.num_kv_heads, B);
+            RopeQkKernel<<<grid_rope, 32, 0, stream>>>(
+                impl.q_rows.f32(), impl.kv_k_rows.f32(),
+                int(c.num_heads), int(c.num_kv_heads), int(c.head_dim),
+                positions_dev, c.rope_theta);
+            ScatterKv2Kernel<<<B, threads, 0, stream>>>(
+                impl.kv_k_rows.f32(), impl.kv_v_rows.f32(),
+                impl.pool.k_layer(l), impl.pool.v_layer(l), tables_dev,
+                positions_dev, int(impl.pool.block_tokens()), kv_dim);
+            dim3 grid_attn(c.num_heads, splits, B);
+            BatchSplitAttentionKernel
+                <<<grid_attn, kAttnThreads, 0, stream>>>(
+                    impl.q_rows.f32(), impl.pool.k_layer(l),
+                    impl.pool.v_layer(l), tables_dev,
+                    int(impl.pool.block_tokens()), positions_dev,
+                    impl.batch_partials.f32(), int(c.head_dim), kv_dim,
+                    group, attn_scale, splits);
+            dim3 grid_combine(c.num_heads, B);
+            BatchCombineAttentionKernel
+                <<<grid_combine, c.head_dim, 0, stream>>>(
+                    impl.batch_partials.f32(), impl.attn_rows.f32(),
+                    int(c.head_dim), splits);
+        }
+        LaunchMatVecEpiB<B, true, false>(
+            layer.o_w, impl.attn_rows.f32(), nullptr, nullptr, q_dim, h,
+            impl.x_rows.f32(), h, stream);
+
+        NormScaleKernel<<<B, 256, 0, stream>>>(
+            impl.x_rows.f32(), c.rms_norm_eps, h,
+            impl.d_norm_scales.f32());
+        LaunchFusedGateUpB<B>(layer.gate_w, layer.up_w, impl.x_rows.f32(),
+                              layer.post_norm.f32(),
+                              impl.d_norm_scales.f32(), h,
+                              impl.gate_rows.f32(),
+                              int(c.intermediate_size), stream);
+        LaunchMatVecEpiB<B, true, false>(
+            layer.down_w, impl.gate_rows.f32(), nullptr, nullptr,
+            int(c.intermediate_size), h, impl.x_rows.f32(), h, stream);
+    }
+
+    NormScaleKernel<<<B, 256, 0, stream>>>(impl.x_rows.f32(),
+                                           c.rms_norm_eps, h,
+                                           impl.d_norm_scales.f32());
+    const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+    LaunchMatVecEpiB<B, false, true>(head, impl.x_rows.f32(),
+                                     impl.final_norm.f32(),
+                                     impl.d_norm_scales.f32(), h,
+                                     int(c.vocab_size),
+                                     impl.batch_logits.f32(),
+                                     int(c.vocab_size), stream);
+}
 
 // Paged per-sequence state: logical capacity is max_tokens; physical
 // blocks are allocated on demand and released on destruction (spec §16.1
@@ -1368,6 +1766,9 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
         const size_t kv_dim_sz = size_t(c.num_kv_heads) * c.head_dim;
         if (s.ok()) {
             s = impl.d_positions.AllocBytes(kMaxBatch * sizeof(uint32_t));
+        }
+        if (s.ok()) {
+            s = impl.d_norm_scales.AllocBytes(kMaxBatch * sizeof(float));
         }
         if (s.ok()) {
             s = impl.d_seq_tables.AllocBytes(kMaxBatch * sizeof(int*));
@@ -1909,6 +2310,26 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
         // per-token value is read from device memory, so this sequence
         // of launches is capturable and replayable.
         auto pipeline = [&](uint32_t nb) {
+            if (nb <= 8) {
+                switch (nb) {
+                    case 1:
+                        RunFusedDecode<1>(impl, c, positions_dev,
+                                          tables_dev, splits, stream);
+                        return;
+                    case 2:
+                        RunFusedDecode<2>(impl, c, positions_dev,
+                                          tables_dev, splits, stream);
+                        return;
+                    case 4:
+                        RunFusedDecode<4>(impl, c, positions_dev,
+                                          tables_dev, splits, stream);
+                        return;
+                    default:
+                        RunFusedDecode<8>(impl, c, positions_dev,
+                                          tables_dev, splits, stream);
+                        return;
+                }
+            }
             auto project = [&](const float* x, const WeightBuffer& w,
                                const float* bias, int in_dim, int out_dim,
                                float* y, int ldy) {
