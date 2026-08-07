@@ -329,6 +329,25 @@ __global__ void ScatterRowsKernel(const float* __restrict__ src,
     }
 }
 
+// Graph-safe KV scatter: destination is derived on device from the
+// sequence's block table and current position, so the same captured
+// graph replays correctly as positions advance.
+__global__ void ScatterKvPagedKernel(const float* __restrict__ src,
+                                     float* __restrict__ pool,
+                                     const int* const* __restrict__ tables,
+                                     const uint32_t* __restrict__ positions,
+                                     int block_tokens, int kv_dim) {
+    const int row = blockIdx.x;
+    const int* table = tables[row];
+    const int t = int(positions[row]);
+    float* dst = pool + (size_t(table[t / block_tokens]) * block_tokens +
+                         (t % block_tokens)) *
+                            kv_dim;
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+        dst[i] = src[size_t(row) * kv_dim + i];
+    }
+}
+
 __global__ void BatchSplitAttentionKernel(
     const float* __restrict__ q_rows, const float* __restrict__ k_pool,
     const float* __restrict__ v_pool,
@@ -911,32 +930,41 @@ void LaunchMatVec(const WeightBuffer& w, const float* x, const float* bias,
 
 void LaunchMatVecBatch(const float* x, const WeightBuffer& w,
                        const float* bias, int batch, int in_dim,
-                       int out_dim, float* y, int ldy) {
+                       int out_dim, float* y, int ldy,
+                       cudaStream_t stream = nullptr) {
     WithWeightView(w, in_dim, [&](auto view) {
-        if (batch <= 2) {
+        if (batch <= 1) {
+            MatVecKernel<<<out_dim, 128, 0, stream>>>(view, x, bias,
+                                                      in_dim, y);
+        } else if (batch <= 2) {
             MatVecBatchKernel<decltype(view), 2>
-                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+                <<<out_dim, 128, 0, stream>>>(view, x, bias, in_dim, y,
+                                              ldy);
         } else if (batch <= 4) {
             MatVecBatchKernel<decltype(view), 4>
-                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+                <<<out_dim, 128, 0, stream>>>(view, x, bias, in_dim, y,
+                                              ldy);
         } else if (batch <= 8) {
             MatVecBatchKernel<decltype(view), 8>
-                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+                <<<out_dim, 128, 0, stream>>>(view, x, bias, in_dim, y,
+                                              ldy);
         } else {
             MatVecBatchKernel<decltype(view), 16>
-                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+                <<<out_dim, 128, 0, stream>>>(view, x, bias, in_dim, y,
+                                              ldy);
         }
     });
 }
 
 void LaunchGemm(const float* x, const WeightBuffer& w, const float* bias,
-                int n, int in_dim, int out_dim, float* c, int ldc) {
+                int n, int in_dim, int out_dim, float* c, int ldc,
+                cudaStream_t stream = nullptr) {
     dim3 grid((out_dim + kGemmTile - 1) / kGemmTile,
               (n + kGemmTile - 1) / kGemmTile);
     dim3 block(kGemmTile, kGemmTile);
     WithWeightView(w, in_dim, [&](auto view) {
-        GemmXWtKernel<<<grid, block>>>(x, view, bias, n, in_dim, out_dim,
-                                       c, ldc);
+        GemmXWtKernel<<<grid, block, 0, stream>>>(x, view, bias, n, in_dim,
+                                                  out_dim, c, ldc);
     });
 }
 
@@ -1096,11 +1124,29 @@ struct QwenCudaModel::Impl {
     bool chunked_prefill = false;
 
     DeviceBuffer d_positions;
-    DeviceBuffer d_kv_ptrs;     // [layers, 2, kMaxBatch] float* rows
     DeviceBuffer d_seq_tables;  // [kMaxBatch] const int*
     DeviceBuffer kv_k_rows, kv_v_rows;
     DeviceBuffer batch_logits;
     DeviceBuffer batch_partials;
+
+    // CUDA Graphs (decode fast path): one captured graph per batch
+    // bucket. Every per-token input lives in device memory (tokens,
+    // positions, per-sequence table pointers), so a graph replays with
+    // fixed kernel parameters and grid shapes.
+    cudaStream_t stream = nullptr;
+    // Keyed by (batch bucket {1,2,4,8,16}, splits bucket {1,8,32}).
+    cudaGraphExec_t decode_graphs[5][3] = {};
+    DeviceBuffer pad_table;  // int[1]: reserved scratch block id
+    int scratch_block = -1;  // sink for padding-row KV writes
+
+    ~Impl() {
+        for (auto& row : decode_graphs) {
+            for (cudaGraphExec_t g : row) {
+                if (g != nullptr) cudaGraphExecDestroy(g);
+            }
+        }
+        if (stream != nullptr) cudaStreamDestroy(stream);
+    }
 };
 
 namespace {
@@ -1324,11 +1370,28 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
             s = impl.d_positions.AllocBytes(kMaxBatch * sizeof(uint32_t));
         }
         if (s.ok()) {
-            s = impl.d_kv_ptrs.AllocBytes(size_t(c.num_layers) * 2 *
-                                          kMaxBatch * sizeof(float*));
-        }
-        if (s.ok()) {
             s = impl.d_seq_tables.AllocBytes(kMaxBatch * sizeof(int*));
+        }
+        if (s.ok() &&
+            cudaStreamCreate(&impl.stream) != cudaSuccess) {
+            s = Status(ErrorCode::kGpuUnhealthy, "stream creation failed",
+                       kComponent);
+        }
+        // Reserve one pool block as the write sink for padding rows in
+        // graph-replayed decode batches.
+        if (s.ok()) {
+            if (!impl.pool.Allocate(impl.scratch_block)) {
+                s = Status(ErrorCode::kGpuOom, "kv pool too small",
+                           kComponent);
+            }
+        }
+        if (s.ok()) s = impl.pad_table.AllocBytes(sizeof(int));
+        if (s.ok() &&
+            cudaMemcpy(impl.pad_table.ptr, &impl.scratch_block,
+                       sizeof(int),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            s = Status(ErrorCode::kGpuUnhealthy, "pad table upload failed",
+                       kComponent);
         }
         if (s.ok()) {
             s = impl.kv_k_rows.AllocBytes(rows * kv_dim_sz * 4);
@@ -1356,7 +1419,9 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
 }
 
 uint32_t QwenCudaModel::kv_blocks_total() const {
-    return impl_->pool.num_blocks();
+    // Usable blocks: the padding scratch block is permanently reserved.
+    return impl_->pool.num_blocks() -
+           (impl_->scratch_block >= 0 ? 1 : 0);
 }
 uint32_t QwenCudaModel::kv_blocks_free() const {
     return impl_->pool.free_blocks();
@@ -1706,6 +1771,14 @@ Status QwenCudaModel::Prefill(SequenceState& state,
 
 Status QwenCudaModel::Decode(SequenceState& state, uint32_t token,
                              std::vector<float>& logits) {
+    if (impl_->chunked_prefill) {
+        // Single-sequence decode replays the bucket-1 CUDA graph.
+        std::vector<DecodeBatchItem> items = {{&state, token, &logits}};
+        std::vector<Status> per_item;
+        Status s = DecodeBatch(items, per_item);
+        if (!s.ok()) return s;
+        return per_item[0];
+    }
     auto& seq = static_cast<CudaSequenceState&>(state);
     if (token >= config_.vocab_size) {
         return Status(ErrorCode::kInvalidRequest,
@@ -1724,7 +1797,7 @@ Status QwenCudaModel::Decode(SequenceState& state, uint32_t token,
 Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
                                   std::vector<Status>& per_item) {
     per_item.assign(items.size(), Status::Ok());
-    if (items.size() <= 1 || !impl_->chunked_prefill) {
+    if (!impl_->chunked_prefill) {
         return GenerativeModel::DecodeBatch(items, per_item);
     }
     const QwenConfig& c = config_;
@@ -1735,6 +1808,7 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
     const int group = int(c.num_heads / c.num_kv_heads);
     const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
     const int threads = 256;
+    cudaStream_t stream = impl.stream;
 
     LYKURO_CUDA_CHECK(cudaSetDevice(device_id_), "cuda device not usable");
 
@@ -1761,160 +1835,218 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
          group_start += kMaxBatch) {
         const uint32_t b = uint32_t(std::min<size_t>(
             kMaxBatch, valid.size() - group_start));
+        // Graph bucket: smallest of {1,2,4,8,16} that fits `b`. Grid
+        // shapes are baked per bucket; padding rows write into the
+        // reserved scratch block and their outputs are ignored.
+        int bucket_idx = 0;
+        uint32_t bucket = 1;
+        while (bucket < b) {
+            bucket <<= 1;
+            ++bucket_idx;
+        }
+
+        uint32_t max_context = 0;
+        for (uint32_t i = 0; i < b; ++i) {
+            const size_t item_idx = valid[group_start + i];
+            auto* state = static_cast<CudaSequenceState*>(
+                items[item_idx].state);
+            max_context = std::max(max_context, state->length() + 1);
+        }
+        // Split-count buckets keep short-context replays cheap while the
+        // graph's grid shape stays fixed per key.
+        int splits_idx;
+        int splits;
+        if (max_context <= 128) {
+            splits_idx = 0;
+            splits = 1;
+        } else if (max_context <= 1024) {
+            splits_idx = 1;
+            splits = 8;
+        } else {
+            splits_idx = 2;
+            splits = kMaxSplits;
+        }
 
         uint32_t tokens[kMaxBatch];
         uint32_t positions[kMaxBatch];
         const int* seq_tables[kMaxBatch];
-        uint32_t max_context = 0;
-        std::vector<float*> kv_ptrs(size_t(c.num_layers) * 2 * b);
-        for (uint32_t i = 0; i < b; ++i) {
-            const size_t item_idx = valid[group_start + i];
-            auto* state =
-                static_cast<CudaSequenceState*>(items[item_idx].state);
-            tokens[i] = items[item_idx].token;
-            positions[i] = state->length();
-            seq_tables[i] = state->device_table();
-            max_context = std::max(max_context, positions[i] + 1);
-            for (uint32_t l = 0; l < c.num_layers; ++l) {
-                kv_ptrs[(size_t(l) * 2 + 0) * b + i] =
-                    state->KeyRowHost(impl.pool, l, positions[i], kv_dim);
-                kv_ptrs[(size_t(l) * 2 + 1) * b + i] =
-                    state->ValueRowHost(impl.pool, l, positions[i], kv_dim);
+        for (uint32_t i = 0; i < bucket; ++i) {
+            if (i < b) {
+                const size_t item_idx = valid[group_start + i];
+                auto* state = static_cast<CudaSequenceState*>(
+                    items[item_idx].state);
+                tokens[i] = items[item_idx].token;
+                positions[i] = state->length();
+                seq_tables[i] = state->device_table();
+            } else {
+                tokens[i] = 0;
+                positions[i] = 0;
+                seq_tables[i] = impl.pad_table.i32();
             }
         }
         LYKURO_CUDA_CHECK(
-            cudaMemcpy(impl.d_tokens.ptr, tokens, b * sizeof(uint32_t),
-                       cudaMemcpyHostToDevice),
+            cudaMemcpyAsync(impl.d_tokens.ptr, tokens,
+                            bucket * sizeof(uint32_t),
+                            cudaMemcpyHostToDevice, stream),
             "token upload failed");
         LYKURO_CUDA_CHECK(
-            cudaMemcpy(impl.d_positions.ptr, positions,
-                       b * sizeof(uint32_t), cudaMemcpyHostToDevice),
+            cudaMemcpyAsync(impl.d_positions.ptr, positions,
+                            bucket * sizeof(uint32_t),
+                            cudaMemcpyHostToDevice, stream),
             "position upload failed");
         LYKURO_CUDA_CHECK(
-            cudaMemcpy(impl.d_kv_ptrs.ptr, kv_ptrs.data(),
-                       kv_ptrs.size() * sizeof(float*),
-                       cudaMemcpyHostToDevice),
-            "kv pointer upload failed");
-        LYKURO_CUDA_CHECK(
-            cudaMemcpy(impl.d_seq_tables.ptr, seq_tables,
-                       b * sizeof(const int*), cudaMemcpyHostToDevice),
+            cudaMemcpyAsync(impl.d_seq_tables.ptr, seq_tables,
+                            bucket * sizeof(const int*),
+                            cudaMemcpyHostToDevice, stream),
             "table pointer upload failed");
 
-        // Projection dispatch: shared-staged batched GEMV amortizes
-        // weight reads for small batches; the tiled GEMM wins once the
-        // batch approaches its 16-wide tile.
-        auto project = [&](const float* x, const WeightBuffer& w,
-                           const float* bias, int in_dim, int out_dim,
-                           float* y, int ldy) {
-            if (b > 8) {
-                LaunchGemm(x, w, bias, int(b), in_dim, out_dim, y, ldy);
-            } else {
-                LaunchMatVecBatch(x, w, bias, int(b), in_dim, out_dim, y,
-                                  ldy);
-            }
-        };
-
-        int splits = (int(max_context) + 127) / 128;
-        if (splits > kMaxSplits) splits = kMaxSplits;
         auto* positions_dev =
             static_cast<const uint32_t*>(impl.d_positions.ptr);
-        auto* ptr_table = static_cast<float* const*>(impl.d_kv_ptrs.ptr);
         auto* tables_dev =
             static_cast<const int* const*>(impl.d_seq_tables.ptr);
 
-        if (impl.embed.bf16) {
-            GatherEmbedRowsKernel<__nv_bfloat16><<<b, threads>>>(
-                static_cast<const __nv_bfloat16*>(impl.embed.buf.ptr),
-                static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
-                impl.x_rows.f32());
-        } else {
-            GatherEmbedRowsKernel<float><<<b, threads>>>(
-                static_cast<const float*>(impl.embed.buf.ptr),
-                static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
-                impl.x_rows.f32());
-        }
-
-        const int rows_h = int(b) * h;
-        const int rows_i = int(b) * int(c.intermediate_size);
-        for (uint32_t l = 0; l < c.num_layers; ++l) {
-            Impl::Layer& layer = impl.layers[l];
-            float* const* k_rows = ptr_table + (size_t(l) * 2 + 0) * b;
-            float* const* v_rows = ptr_table + (size_t(l) * 2 + 1) * b;
-
-            RmsNormRowsKernel<<<b, 256>>>(
-                impl.x_rows.f32(), layer.input_norm.f32(), c.rms_norm_eps,
-                h, impl.xn_rows.f32());
-            project(impl.xn_rows.f32(), layer.q_w, layer.q_b.f32(), h,
-                    q_dim, impl.q_rows.f32(), q_dim);
-            project(impl.xn_rows.f32(), layer.k_w, layer.k_b.f32(), h,
-                    kv_dim, impl.kv_k_rows.f32(), kv_dim);
-            project(impl.xn_rows.f32(), layer.v_w, layer.v_b.f32(), h,
-                    kv_dim, impl.kv_v_rows.f32(), kv_dim);
-
-            {
-                dim3 grid_q(c.num_heads, b);
-                dim3 grid_kv(c.num_kv_heads, b);
-                RopeVarPosKernel<<<grid_q, 32>>>(impl.q_rows.f32(), q_dim,
-                                                 int(c.head_dim),
-                                                 positions_dev,
-                                                 c.rope_theta);
-                RopeVarPosKernel<<<grid_kv, 32>>>(impl.kv_k_rows.f32(),
-                                                  kv_dim, int(c.head_dim),
-                                                  positions_dev,
-                                                  c.rope_theta);
-                ScatterRowsKernel<<<b, threads>>>(impl.kv_k_rows.f32(),
-                                                  k_rows, kv_dim);
-                ScatterRowsKernel<<<b, threads>>>(impl.kv_v_rows.f32(),
-                                                  v_rows, kv_dim);
-                dim3 grid_attn(c.num_heads, splits, b);
-                BatchSplitAttentionKernel<<<grid_attn, kAttnThreads>>>(
-                    impl.q_rows.f32(), impl.pool.k_layer(l),
-                    impl.pool.v_layer(l), tables_dev,
-                    int(impl.pool.block_tokens()), positions_dev,
-                    impl.batch_partials.f32(), int(c.head_dim), kv_dim,
-                    group, attn_scale, splits);
-                dim3 grid_combine(c.num_heads, b);
-                BatchCombineAttentionKernel<<<grid_combine, c.head_dim>>>(
-                    impl.batch_partials.f32(), impl.attn_rows.f32(),
-                    int(c.head_dim), splits);
+        // The full decode pipeline for a fixed bucket size; every
+        // per-token value is read from device memory, so this sequence
+        // of launches is capturable and replayable.
+        auto pipeline = [&](uint32_t nb) {
+            auto project = [&](const float* x, const WeightBuffer& w,
+                               const float* bias, int in_dim, int out_dim,
+                               float* y, int ldy) {
+                if (nb > 8) {
+                    LaunchGemm(x, w, bias, int(nb), in_dim, out_dim, y,
+                               ldy, stream);
+                } else {
+                    LaunchMatVecBatch(x, w, bias, int(nb), in_dim,
+                                      out_dim, y, ldy, stream);
+                }
+            };
+            if (impl.embed.bf16) {
+                GatherEmbedRowsKernel<__nv_bfloat16>
+                    <<<nb, threads, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(
+                            impl.embed.buf.ptr),
+                        static_cast<const uint32_t*>(impl.d_tokens.ptr),
+                        h, impl.x_rows.f32());
+            } else {
+                GatherEmbedRowsKernel<float><<<nb, threads, 0, stream>>>(
+                    static_cast<const float*>(impl.embed.buf.ptr),
+                    static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+                    impl.x_rows.f32());
             }
-
-            project(impl.attn_rows.f32(), layer.o_w, nullptr, q_dim, h,
-                    impl.proj_rows.f32(), h);
-            AddKernel<<<(rows_h + threads - 1) / threads, threads>>>(
-                impl.x_rows.f32(), impl.proj_rows.f32(), rows_h);
-
-            RmsNormRowsKernel<<<b, 256>>>(
-                impl.x_rows.f32(), layer.post_norm.f32(), c.rms_norm_eps,
+            const int rows_h = int(nb) * h;
+            const int rows_i = int(nb) * int(c.intermediate_size);
+            for (uint32_t l = 0; l < c.num_layers; ++l) {
+                Impl::Layer& layer = impl.layers[l];
+                RmsNormRowsKernel<<<nb, 256, 0, stream>>>(
+                    impl.x_rows.f32(), layer.input_norm.f32(),
+                    c.rms_norm_eps, h, impl.xn_rows.f32());
+                project(impl.xn_rows.f32(), layer.q_w, layer.q_b.f32(), h,
+                        q_dim, impl.q_rows.f32(), q_dim);
+                project(impl.xn_rows.f32(), layer.k_w, layer.k_b.f32(), h,
+                        kv_dim, impl.kv_k_rows.f32(), kv_dim);
+                project(impl.xn_rows.f32(), layer.v_w, layer.v_b.f32(), h,
+                        kv_dim, impl.kv_v_rows.f32(), kv_dim);
+                {
+                    dim3 grid_q(c.num_heads, nb);
+                    dim3 grid_kv(c.num_kv_heads, nb);
+                    RopeVarPosKernel<<<grid_q, 32, 0, stream>>>(
+                        impl.q_rows.f32(), q_dim, int(c.head_dim),
+                        positions_dev, c.rope_theta);
+                    RopeVarPosKernel<<<grid_kv, 32, 0, stream>>>(
+                        impl.kv_k_rows.f32(), kv_dim, int(c.head_dim),
+                        positions_dev, c.rope_theta);
+                    ScatterKvPagedKernel<<<nb, threads, 0, stream>>>(
+                        impl.kv_k_rows.f32(), impl.pool.k_layer(l),
+                        tables_dev, positions_dev,
+                        int(impl.pool.block_tokens()), kv_dim);
+                    ScatterKvPagedKernel<<<nb, threads, 0, stream>>>(
+                        impl.kv_v_rows.f32(), impl.pool.v_layer(l),
+                        tables_dev, positions_dev,
+                        int(impl.pool.block_tokens()), kv_dim);
+                    // Fixed split count keeps the grid shape constant
+                    // across replays; empty splits contribute nothing.
+                    dim3 grid_attn(c.num_heads, splits, nb);
+                    BatchSplitAttentionKernel
+                        <<<grid_attn, kAttnThreads, 0, stream>>>(
+                            impl.q_rows.f32(), impl.pool.k_layer(l),
+                            impl.pool.v_layer(l), tables_dev,
+                            int(impl.pool.block_tokens()), positions_dev,
+                            impl.batch_partials.f32(), int(c.head_dim),
+                            kv_dim, group, attn_scale, splits);
+                    dim3 grid_combine(c.num_heads, nb);
+                    BatchCombineAttentionKernel
+                        <<<grid_combine, c.head_dim, 0, stream>>>(
+                            impl.batch_partials.f32(),
+                            impl.attn_rows.f32(), int(c.head_dim),
+                            splits);
+                }
+                project(impl.attn_rows.f32(), layer.o_w, nullptr, q_dim,
+                        h, impl.proj_rows.f32(), h);
+                AddKernel<<<(rows_h + threads - 1) / threads, threads, 0,
+                            stream>>>(impl.x_rows.f32(),
+                                      impl.proj_rows.f32(), rows_h);
+                RmsNormRowsKernel<<<nb, 256, 0, stream>>>(
+                    impl.x_rows.f32(), layer.post_norm.f32(),
+                    c.rms_norm_eps, h, impl.xn_rows.f32());
+                project(impl.xn_rows.f32(), layer.gate_w, nullptr, h,
+                        int(c.intermediate_size), impl.gate_rows.f32(),
+                        int(c.intermediate_size));
+                project(impl.xn_rows.f32(), layer.up_w, nullptr, h,
+                        int(c.intermediate_size), impl.up_rows.f32(),
+                        int(c.intermediate_size));
+                SwigluKernel<<<(rows_i + threads - 1) / threads, threads,
+                               0, stream>>>(impl.gate_rows.f32(),
+                                            impl.up_rows.f32(), rows_i);
+                project(impl.gate_rows.f32(), layer.down_w, nullptr,
+                        int(c.intermediate_size), h, impl.proj_rows.f32(),
+                        h);
+                AddKernel<<<(rows_h + threads - 1) / threads, threads, 0,
+                            stream>>>(impl.x_rows.f32(),
+                                      impl.proj_rows.f32(), rows_h);
+            }
+            RmsNormRowsKernel<<<nb, 256, 0, stream>>>(
+                impl.x_rows.f32(), impl.final_norm.f32(), c.rms_norm_eps,
                 h, impl.xn_rows.f32());
-            project(impl.xn_rows.f32(), layer.gate_w, nullptr, h,
-                    int(c.intermediate_size), impl.gate_rows.f32(),
-                    int(c.intermediate_size));
-            project(impl.xn_rows.f32(), layer.up_w, nullptr, h,
-                    int(c.intermediate_size), impl.up_rows.f32(),
-                    int(c.intermediate_size));
-            SwigluKernel<<<(rows_i + threads - 1) / threads, threads>>>(
-                impl.gate_rows.f32(), impl.up_rows.f32(), rows_i);
-            project(impl.gate_rows.f32(), layer.down_w, nullptr,
-                    int(c.intermediate_size), h, impl.proj_rows.f32(), h);
-            AddKernel<<<(rows_h + threads - 1) / threads, threads>>>(
-                impl.x_rows.f32(), impl.proj_rows.f32(), rows_h);
-        }
+            const WeightBuffer& head =
+                impl.tied ? impl.embed : impl.lm_head;
+            project(impl.xn_rows.f32(), head, nullptr, h,
+                    int(c.vocab_size), impl.batch_logits.f32(),
+                    int(c.vocab_size));
+        };
 
-        RmsNormRowsKernel<<<b, 256>>>(impl.x_rows.f32(),
-                                      impl.final_norm.f32(),
-                                      c.rms_norm_eps, h,
-                                      impl.xn_rows.f32());
-        const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
-        project(impl.xn_rows.f32(), head, nullptr, h, int(c.vocab_size),
-                impl.batch_logits.f32(), int(c.vocab_size));
+        // Capture once per bucket, then replay.
+        if (impl.decode_graphs[bucket_idx][splits_idx] == nullptr) {
+            if (cudaStreamBeginCapture(stream,
+                                       cudaStreamCaptureModeGlobal) !=
+                cudaSuccess) {
+                return Status(ErrorCode::kGpuUnhealthy,
+                              "graph capture failed", kComponent);
+            }
+            pipeline(bucket);
+            cudaGraph_t graph = nullptr;
+            if (cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
+                cudaGraphInstantiate(
+                    &impl.decode_graphs[bucket_idx][splits_idx], graph,
+                    nullptr, nullptr, 0) != cudaSuccess) {
+                if (graph != nullptr) cudaGraphDestroy(graph);
+                return Status(ErrorCode::kGpuUnhealthy,
+                              "graph instantiation failed", kComponent);
+            }
+            cudaGraphDestroy(graph);
+        }
+        LYKURO_CUDA_CHECK(
+            cudaGraphLaunch(impl.decode_graphs[bucket_idx][splits_idx],
+                            stream),
+            "graph launch failed");
 
         std::vector<float> host_logits(size_t(b) * c.vocab_size);
         LYKURO_CUDA_CHECK(
-            cudaMemcpy(host_logits.data(), impl.batch_logits.ptr,
-                       host_logits.size() * sizeof(float),
-                       cudaMemcpyDeviceToHost),
+            cudaMemcpyAsync(host_logits.data(), impl.batch_logits.ptr,
+                            host_logits.size() * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream),
             "logits download failed");
+        LYKURO_CUDA_CHECK(cudaStreamSynchronize(stream),
+                          "device execution failed");
         LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
 
         for (uint32_t i = 0; i < b; ++i) {

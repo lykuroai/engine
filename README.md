@@ -129,8 +129,18 @@ artifact 化し、HF transformers FP32 を oracle として照合
     ピーク 360GB/s)であることが判明。量子化の速度便益はより大きな
     model か CUDA Graphs 導入(今後の課題)とセットで発現する
 
-  Phase 4 主要項目は以上で完了。今後: CUDA Graphs による起動
-  オーバーヘッド削減、offline 量子化(artifact pipeline + 品質評価)。
+  **CUDA Graphs(decode fast path)実装済み**: per-token 入力(token /
+  position / block table pointer)を全て device メモリ経由にし、decode
+  pipeline を (batch bucket {1,2,4,8,16} × splits bucket {1,8,32}) キーで
+  lazy capture・replay。pad 行は予約 scratch block に書き実データを
+  汚さない。実測では throughput は同等〜微増(batch1: 153 tok/s、
+  batch16: 448 tok/s)で、**律速はカーネル起動 API ではなく、依存
+  チェーン上の小カーネル実行レイテンシ**と判明(per-token の host 側
+  作業は約 290 launch → memcpy 3 回 + graph launch 1 回に削減され、
+  engine スレッドの CPU 余力は大幅改善)。次の速度改善は kernel fusion。
+
+  Phase 4 主要項目は以上で完了。今後: kernel fusion、offline 量子化
+  (artifact pipeline + 品質評価)、§25.3 完全 benchmark。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。
