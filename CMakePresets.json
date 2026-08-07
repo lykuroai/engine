@@ -1,0 +1,45 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Development (Debug, sanitizers)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LYKURO_ENABLE_SANITIZERS": "ON",
+        "LYKURO_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (reproducible)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LYKURO_ENABLE_SANITIZERS": "OFF",
+        "LYKURO_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "release-cuda",
+      "displayName": "Release with CUDA backend (Linux only)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/release-cuda",
+      "cacheVariables": {
+        "LYKURO_ENABLE_CUDA": "ON",
+        "LYKURO_ENABLE_GRPC": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+  ]
+}

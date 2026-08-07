@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package lykuro.nie.v1;
+
+import "lykuro/nie/v1/common.proto";
+
+// Control API (spec §9.3): callable only by the Lykuro Model Manager service
+// identity. Gateway identities are rejected with AUTHENTICATION_FAILED
+// (control/data scope separation, spec §8.2).
+service ControlService {
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+  rpc GetModelStatus(GetModelStatusRequest) returns (GetModelStatusResponse);
+  rpc GetCapacity(GetCapacityRequest) returns (GetCapacityResponse);
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+}
+
+message LoadModelRequest {
+  // Path must resolve inside the read-only approved model mount (/models).
+  // The engine re-verifies signature/digest regardless of caller claims.
+  string artifact_path = 1;
+  string expected_artifact_id = 2;   // load fails on mismatch
+  string device_profile = 3;         // certified profile id to run under
+}
+
+message LoadModelResponse {
+  string model_instance_id = 1;
+  ModelState state = 2;
+  EngineError error = 3;             // set when load was rejected
+}
+
+message UnloadModelRequest {
+  string model_instance_id = 1;
+  // Grace period for active requests before forced cancel (spec §12.5).
+  uint32 drain_timeout_ms = 2;
+}
+
+message UnloadModelResponse {
+  ModelState state = 1;
+}
+
+message DrainRequest {}
+message DrainResponse {
+  uint32 active_requests = 1;
+  uint32 queued_requests = 2;
+}
+
+message ResumeRequest {}
+message ResumeResponse {
+  bool accepting = 1;
+}
+
+enum ModelState {
+  MODEL_STATE_UNSPECIFIED = 0;
+  MODEL_STATE_REGISTERED = 1;
+  MODEL_STATE_VALIDATING = 2;
+  MODEL_STATE_STAGING = 3;
+  MODEL_STATE_TESTING = 4;
+  MODEL_STATE_READY = 5;
+  MODEL_STATE_DRAINING = 6;
+  MODEL_STATE_UNLOADING = 7;
+  MODEL_STATE_FAILED = 8;
+  MODEL_STATE_UNLOADED = 9;
+}
+
+enum EngineState {
+  ENGINE_STATE_UNSPECIFIED = 0;
+  ENGINE_STATE_STARTING = 1;
+  ENGINE_STATE_IDLE = 2;
+  ENGINE_STATE_LOADING = 3;
+  ENGINE_STATE_READY = 4;
+  ENGINE_STATE_DRAINING = 5;
+  ENGINE_STATE_DEGRADED = 6;
+  ENGINE_STATE_RECOVERING = 7;
+  ENGINE_STATE_STOPPED = 8;
+}
+
+message GetModelStatusRequest {
+  string model_instance_id = 1;      // empty = active model
+}
+
+message GetModelStatusResponse {
+  string model_instance_id = 1;
+  ModelState state = 2;
+  EngineState engine_state = 3;
+  string artifact_id = 4;
+  string architecture = 5;
+  string plugin_version = 6;
+  int64 loaded_at_unix_ms = 7;
+}
+
+message GetCapacityRequest {}
+
+// Capacity report (spec §25.2). Metadata only, never content.
+message GetCapacityResponse {
+  uint64 total_vram_bytes = 1;
+  uint64 free_vram_bytes = 2;
+  uint64 reserved_vram_bytes = 3;
+  uint32 active_sequences = 4;
+  uint32 max_sequences = 5;
+  uint32 queued_requests = 6;
+  uint32 max_queue = 7;
+  uint64 kv_used_bytes = 8;
+  uint64 kv_free_bytes = 9;
+  string loaded_model_instance_id = 10;
+  uint32 context_limit_tokens = 11;
+  uint32 estimated_admission_tokens = 12;
+  bool gpu_healthy = 13;
+  bool throttled = 14;
+}
+
+message GetManifestRequest {
+  string model_instance_id = 1;
+}
+
+// Metadata subset of the manifest; never includes weights or file paths
+// outside the artifact root.
+message GetManifestResponse {
+  string artifact_id = 1;
+  string model_family = 2;
+  string architecture = 3;
+  string model_version = 4;
+  string weight_format = 5;
+  string precision = 6;
+  uint32 max_context_tokens = 7;
+  string tokenizer_type = 8;
+  string chat_template_id = 9;
+  string license_review_id = 10;
+  repeated string certified_profile_ids = 11;
+}
