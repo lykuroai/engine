@@ -51,6 +51,10 @@ private:
     struct Impl;
     Status ForwardToken(uint32_t token, uint32_t pos, void* sequence_state,
                         std::vector<float>& logits_out, bool want_logits);
+    // Batched prefill over a chunk of prompt tokens (GEMM path).
+    Status ForwardChunk(const uint32_t* tokens, uint32_t n, uint32_t pos0,
+                        void* sequence_state, std::vector<float>& logits_out,
+                        bool want_logits_of_last);
 
     QwenConfig config_;
     ModelLimits limits_;

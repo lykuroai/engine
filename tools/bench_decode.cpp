@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     }
     const std::string backend = argv[2];
     const int steps = argc > 3 ? std::atoi(argv[3]) : 128;
+    const int prompt_repeat = argc > 4 ? std::atoi(argv[4]) : 1;
 
     ArtifactLoadOptions options;
     options.allow_unsigned_dev = true;
@@ -56,11 +57,13 @@ int main(int argc, char** argv) {
     }
     auto t_load1 = std::chrono::steady_clock::now();
 
+    std::string user_text;
+    for (int i = 0; i < prompt_repeat; ++i) {
+        user_text += "Write a short story about a lighthouse keeper. ";
+    }
     std::vector<uint32_t> prompt;
     Status s = QwenChatTemplate::BuildPrompt(
-        *loaded.artifact.tokenizer,
-        {{Role::kUser, "Write a short story about a lighthouse keeper."}},
-        prompt);
+        *loaded.artifact.tokenizer, {{Role::kUser, user_text}}, prompt);
     if (!s.ok()) {
         std::fprintf(stderr, "prompt build failed\n");
         return 1;

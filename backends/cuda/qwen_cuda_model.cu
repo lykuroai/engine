@@ -168,6 +168,161 @@ __global__ void AttentionKernel(const float* q, const float* k_cache,
     }
 }
 
+// ---- batched prefill kernels (Phase 4 GEMM path) ----
+
+constexpr int kChunk = 128;      // prompt tokens per chunk
+constexpr int kGemmTile = 16;    // tiled GEMM block edge
+
+// C[token, orow] = sum_k X[token, k] * W[orow, k] (+ bias[orow]).
+// X row-major [n, in_dim]; W row-major [out_dim, in_dim]; C row `token`
+// starts at C + token*ldc. Shared-memory tiling reuses each W tile across
+// the token dimension; fixed k-order keeps results deterministic.
+template <typename WT>
+__global__ void GemmXWtKernel(const float* __restrict__ x,
+                              const WT* __restrict__ w,
+                              const float* __restrict__ bias, int n,
+                              int in_dim, int out_dim,
+                              float* __restrict__ c, int ldc) {
+    __shared__ float xs[kGemmTile][kGemmTile];
+    __shared__ float ws[kGemmTile][kGemmTile];
+    const int token = blockIdx.y * kGemmTile + threadIdx.y;
+    const int orow = blockIdx.x * kGemmTile + threadIdx.x;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < in_dim; k0 += kGemmTile) {
+        const int kx = k0 + threadIdx.x;
+        xs[threadIdx.y][threadIdx.x] =
+            (token < n && kx < in_dim) ? x[size_t(token) * in_dim + kx]
+                                       : 0.0f;
+        const int wrow = blockIdx.x * kGemmTile + threadIdx.y;
+        ws[threadIdx.y][threadIdx.x] =
+            (wrow < out_dim && kx < in_dim)
+                ? LoadWeight(w, size_t(wrow) * in_dim + kx)
+                : 0.0f;
+        __syncthreads();
+        for (int kk = 0; kk < kGemmTile; ++kk) {
+            acc += xs[threadIdx.y][kk] * ws[threadIdx.x][kk];
+        }
+        __syncthreads();
+    }
+    if (token < n && orow < out_dim) {
+        c[size_t(token) * ldc + orow] =
+            acc + (bias != nullptr ? bias[orow] : 0.0f);
+    }
+}
+
+// Gathers embeddings for a chunk of tokens into fp32 rows.
+template <typename WT>
+__global__ void GatherEmbedRowsKernel(const WT* __restrict__ embed,
+                                      const uint32_t* __restrict__ tokens,
+                                      int hidden, float* __restrict__ out) {
+    const int row = blockIdx.x;
+    const WT* src = embed + size_t(tokens[row]) * hidden;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        out[size_t(row) * hidden + i] = LoadWeight(src, i);
+    }
+}
+
+// Row-wise RMSNorm over a chunk. grid.x = row.
+__global__ void RmsNormRowsKernel(const float* __restrict__ x,
+                                  const float* __restrict__ weight,
+                                  float eps, int dim,
+                                  float* __restrict__ out) {
+    __shared__ float partial[256];
+    const float* xr = x + size_t(blockIdx.x) * dim;
+    float* outr = out + size_t(blockIdx.x) * dim;
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        local += xr[i] * xr[i];
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / float(dim) + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        outr[i] = xr[i] * scale * weight[i];
+    }
+}
+
+// RoPE over a chunk: grid (head, row). `row_stride` is the float stride
+// between consecutive rows (q buffer: heads*head_dim; K cache: kv_stride).
+__global__ void RopeRowsKernel(float* __restrict__ buf, int row_stride,
+                               int head_dim, uint32_t pos0, float theta) {
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int half = head_dim / 2;
+    float* h = buf + size_t(row) * row_stride + head * head_dim;
+    const uint32_t pos = pos0 + row;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = powf(theta, -2.0f * float(i) / float(head_dim));
+        float angle = float(pos) * freq;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        float a = h[i];
+        float b = h[i + half];
+        h[i] = a * c - b * s;
+        h[i + half] = b * c + a * s;
+    }
+}
+
+// Causal attention for a chunk of query positions using an online
+// (streaming) softmax: no score scratch, deterministic sequential-t
+// recurrence, parallel over (head, query) blocks and head_dim lanes.
+// blockDim.x == head_dim (power of two, <=128, validated at load).
+__global__ void ChunkAttentionKernel(const float* __restrict__ q_buf,
+                                     const float* __restrict__ k_cache,
+                                     const float* __restrict__ v_cache,
+                                     float* __restrict__ out, uint32_t pos0,
+                                     int head_dim, int kv_stride, int group,
+                                     float scale) {
+    const int head = blockIdx.x;
+    const int i = blockIdx.y;             // query index within the chunk
+    const int kv_head = head / group;
+    const int context = int(pos0) + i + 1;
+    const int q_dim = gridDim.x * head_dim;
+    const int d = threadIdx.x;
+
+    __shared__ float qs[128], acc[128], red[128];
+    __shared__ float m_s, denom_s, p_s, corr_s;
+
+    qs[d] = q_buf[size_t(i) * q_dim + head * head_dim + d] * scale;
+    acc[d] = 0.0f;
+    if (d == 0) {
+        m_s = -1e30f;
+        denom_s = 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < context; ++t) {
+        const float* kt =
+            k_cache + size_t(t) * kv_stride + kv_head * head_dim;
+        red[d] = qs[d] * kt[d];
+        __syncthreads();
+        for (int stride = head_dim / 2; stride > 0; stride >>= 1) {
+            if (d < stride) red[d] += red[d + stride];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float s = red[0];
+            const float m_new = fmaxf(m_s, s);
+            corr_s = expf(m_s - m_new);
+            p_s = expf(s - m_new);
+            m_s = m_new;
+            denom_s = denom_s * corr_s + p_s;
+        }
+        __syncthreads();
+        const float* vt =
+            v_cache + size_t(t) * kv_stride + kv_head * head_dim;
+        acc[d] = acc[d] * corr_s + p_s * vt[d];
+        __syncthreads();
+    }
+    out[size_t(i) * q_dim + head * head_dim + d] = acc[d] / denom_s;
+}
+
 __global__ void SwigluKernel(float* gate, const float* up, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < dim) {
@@ -283,6 +438,22 @@ void LaunchMatVec(const WeightBuffer& w, const float* x, const float* bias,
     }
 }
 
+void LaunchGemm(const float* x, const WeightBuffer& w, const float* bias,
+                int n, int in_dim, int out_dim, float* c, int ldc) {
+    dim3 grid((out_dim + kGemmTile - 1) / kGemmTile,
+              (n + kGemmTile - 1) / kGemmTile);
+    dim3 block(kGemmTile, kGemmTile);
+    if (w.bf16) {
+        GemmXWtKernel<__nv_bfloat16><<<grid, block>>>(
+            x, static_cast<const __nv_bfloat16*>(w.buf.ptr), bias, n,
+            in_dim, out_dim, c, ldc);
+    } else {
+        GemmXWtKernel<float><<<grid, block>>>(
+            x, static_cast<const float*>(w.buf.ptr), bias, n, in_dim,
+            out_dim, c, ldc);
+    }
+}
+
 }  // namespace
 
 struct QwenCudaModel::Impl {
@@ -298,6 +469,12 @@ struct QwenCudaModel::Impl {
     bool tied = true;
 
     DeviceBuffer hidden, normed, q, attn_out, proj, gate, up, logits, scores;
+
+    // Chunked-prefill work buffers ([kChunk, dim] rows) and token staging.
+    DeviceBuffer x_rows, xn_rows, q_rows, attn_rows, proj_rows, gate_rows,
+        up_rows;
+    DeviceBuffer d_tokens;  // kChunk uint32
+    bool chunked_prefill = false;  // head_dim power-of-two <= 128
 };
 
 namespace {
@@ -421,6 +598,25 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(const ModelManifest& manifest,
         s = impl.scores.AllocBytes(size_t(c.num_heads) *
                                    c.max_context_tokens * sizeof(float));
     }
+
+    // Chunked prefill needs blockDim == head_dim in the attention kernel.
+    impl.chunked_prefill =
+        c.head_dim <= 128 && (c.head_dim & (c.head_dim - 1)) == 0;
+    if (s.ok() && impl.chunked_prefill) {
+        const size_t rows = kChunk;
+        if (s.ok()) s = impl.x_rows.AllocBytes(rows * c.hidden_size * 4);
+        if (s.ok()) s = impl.xn_rows.AllocBytes(rows * c.hidden_size * 4);
+        if (s.ok()) s = impl.q_rows.AllocBytes(rows * q_dim * 4);
+        if (s.ok()) s = impl.attn_rows.AllocBytes(rows * q_dim * 4);
+        if (s.ok()) s = impl.proj_rows.AllocBytes(rows * c.hidden_size * 4);
+        if (s.ok()) {
+            s = impl.gate_rows.AllocBytes(rows * c.intermediate_size * 4);
+        }
+        if (s.ok()) {
+            s = impl.up_rows.AllocBytes(rows * c.intermediate_size * 4);
+        }
+        if (s.ok()) s = impl.d_tokens.AllocBytes(rows * sizeof(uint32_t));
+    }
     if (!s.ok()) {
         result.status = s;
         return result;
@@ -541,6 +737,119 @@ Status QwenCudaModel::ForwardToken(uint32_t token, uint32_t pos,
     return Status::Ok();
 }
 
+Status QwenCudaModel::ForwardChunk(const uint32_t* tokens, uint32_t n,
+                                   uint32_t pos0, void* sequence_state,
+                                   std::vector<float>& logits_out,
+                                   bool want_logits_of_last) {
+    auto& state = *static_cast<CudaSequenceState*>(sequence_state);
+    const QwenConfig& c = config_;
+    Impl& impl = *impl_;
+    const int h = int(c.hidden_size);
+    const int q_dim = int(c.num_heads * c.head_dim);
+    const int kv_dim = int(c.num_kv_heads * c.head_dim);
+    const int kv_stride = kv_dim;
+    const int group = int(c.num_heads / c.num_kv_heads);
+    const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
+    const int threads = 256;
+    const int rows_elems_h = int(n) * h;
+    const int rows_elems_i = int(n) * int(c.intermediate_size);
+
+    LYKURO_CUDA_CHECK(cudaSetDevice(device_id_), "cuda device not usable");
+    LYKURO_CUDA_CHECK(
+        cudaMemcpy(impl.d_tokens.ptr, tokens, n * sizeof(uint32_t),
+                   cudaMemcpyHostToDevice),
+        "token upload failed");
+
+    if (impl.embed.bf16) {
+        GatherEmbedRowsKernel<__nv_bfloat16><<<n, threads>>>(
+            static_cast<const __nv_bfloat16*>(impl.embed.buf.ptr),
+            static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+            impl.x_rows.f32());
+    } else {
+        GatherEmbedRowsKernel<float><<<n, threads>>>(
+            static_cast<const float*>(impl.embed.buf.ptr),
+            static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+            impl.x_rows.f32());
+    }
+
+    for (uint32_t l = 0; l < c.num_layers; ++l) {
+        Impl::Layer& layer = impl.layers[l];
+        float* k0 = state.KeyAt(l, pos0);
+        float* v0 = state.ValueAt(l, pos0);
+
+        RmsNormRowsKernel<<<n, 256>>>(impl.x_rows.f32(),
+                                      layer.input_norm.f32(),
+                                      c.rms_norm_eps, h, impl.xn_rows.f32());
+        LaunchGemm(impl.xn_rows.f32(), layer.q_w, layer.q_b.f32(), int(n),
+                   h, q_dim, impl.q_rows.f32(), q_dim);
+        LaunchGemm(impl.xn_rows.f32(), layer.k_w, layer.k_b.f32(), int(n),
+                   h, kv_dim, k0, kv_stride);
+        LaunchGemm(impl.xn_rows.f32(), layer.v_w, layer.v_b.f32(), int(n),
+                   h, kv_dim, v0, kv_stride);
+
+        {
+            dim3 grid_q(c.num_heads, n);
+            dim3 grid_kv(c.num_kv_heads, n);
+            RopeRowsKernel<<<grid_q, 32>>>(impl.q_rows.f32(), q_dim,
+                                           int(c.head_dim), pos0,
+                                           c.rope_theta);
+            RopeRowsKernel<<<grid_kv, 32>>>(k0, kv_stride, int(c.head_dim),
+                                            pos0, c.rope_theta);
+            dim3 grid_attn(c.num_heads, n);
+            ChunkAttentionKernel<<<grid_attn, c.head_dim>>>(
+                impl.q_rows.f32(), state.KeyBase(l), state.ValueBase(l),
+                impl.attn_rows.f32(), pos0, int(c.head_dim), kv_stride,
+                group, attn_scale);
+        }
+
+        LaunchGemm(impl.attn_rows.f32(), layer.o_w, nullptr, int(n), q_dim,
+                   h, impl.proj_rows.f32(), h);
+        AddKernel<<<(rows_elems_h + threads - 1) / threads, threads>>>(
+            impl.x_rows.f32(), impl.proj_rows.f32(), rows_elems_h);
+
+        RmsNormRowsKernel<<<n, 256>>>(impl.x_rows.f32(),
+                                      layer.post_norm.f32(), c.rms_norm_eps,
+                                      h, impl.xn_rows.f32());
+        LaunchGemm(impl.xn_rows.f32(), layer.gate_w, nullptr, int(n), h,
+                   int(c.intermediate_size), impl.gate_rows.f32(),
+                   int(c.intermediate_size));
+        LaunchGemm(impl.xn_rows.f32(), layer.up_w, nullptr, int(n), h,
+                   int(c.intermediate_size), impl.up_rows.f32(),
+                   int(c.intermediate_size));
+        SwigluKernel<<<(rows_elems_i + threads - 1) / threads, threads>>>(
+            impl.gate_rows.f32(), impl.up_rows.f32(), rows_elems_i);
+        LaunchGemm(impl.gate_rows.f32(), layer.down_w, nullptr, int(n),
+                   int(c.intermediate_size), h, impl.proj_rows.f32(), h);
+        AddKernel<<<(rows_elems_h + threads - 1) / threads, threads>>>(
+            impl.x_rows.f32(), impl.proj_rows.f32(), rows_elems_h);
+    }
+
+    if (want_logits_of_last) {
+        const float* last_hidden =
+            impl.x_rows.f32() + size_t(n - 1) * h;
+        RmsNormKernel<<<1, 256>>>(last_hidden, impl.final_norm.f32(),
+                                  c.rms_norm_eps, h, impl.normed.f32());
+        const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+        LaunchMatVec(head, impl.normed.f32(), nullptr, h,
+                     int(c.vocab_size), impl.logits.f32());
+        logits_out.resize(c.vocab_size);
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(logits_out.data(), impl.logits.ptr,
+                       c.vocab_size * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "logits download failed");
+        for (float v : logits_out) {
+            if (!std::isfinite(v)) {
+                return Status(ErrorCode::kInferenceFailed,
+                              "logits contain non-finite values",
+                              kComponent);
+            }
+        }
+    }
+    LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
+    return Status::Ok();
+}
+
 Status QwenCudaModel::Prefill(SequenceState& state,
                               const std::vector<uint32_t>& tokens,
                               std::vector<float>& logits) {
@@ -561,6 +870,21 @@ Status QwenCudaModel::Prefill(SequenceState& state,
             return Status(ErrorCode::kInvalidRequest,
                           "token id out of vocab range", kComponent);
         }
+    }
+    if (impl_->chunked_prefill) {
+        size_t done = 0;
+        while (done < tokens.size()) {
+            const uint32_t n =
+                uint32_t(std::min<size_t>(kChunk, tokens.size() - done));
+            const bool last_chunk = done + n == tokens.size();
+            Status s = ForwardChunk(tokens.data() + done, n,
+                                    uint32_t(done), &seq, logits,
+                                    last_chunk);
+            if (!s.ok()) return s;
+            for (uint32_t i = 0; i < n; ++i) seq.Advance();
+            done += n;
+        }
+        return Status::Ok();
     }
     for (size_t i = 0; i < tokens.size(); ++i) {
         const bool last = i + 1 == tokens.size();
