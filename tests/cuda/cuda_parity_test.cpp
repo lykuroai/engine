@@ -418,6 +418,39 @@ TEST_F(CudaParityTest, PrefixCacheEvictionReclaimsUnreferencedBlocks) {
     }
 }
 
+// ---- weight-only quantization (Phase 4) ----
+
+TEST_F(CudaParityTest, QuantizedModelsRunAndStayClose) {
+    for (WeightQuant quant : {WeightQuant::kInt8, WeightQuant::kInt4}) {
+        CudaModelOptions options;
+        options.device_id = TestDevice();
+        options.quantization = quant;
+        auto qmodel = QwenCudaModel::Load(manifest_, file_, options);
+        ASSERT_TRUE(qmodel.status.ok()) << qmodel.status.message();
+
+        const std::vector<uint32_t> prompt = {1, 5, 9, 2, 17, 250};
+        std::unique_ptr<SequenceState> fp_state, q_state;
+        ASSERT_TRUE(cuda_->CreateSequence(128, fp_state).ok());
+        ASSERT_TRUE(qmodel.model->CreateSequence(128, q_state).ok());
+        std::vector<float> fp_logits, q_logits;
+        ASSERT_TRUE(cuda_->Prefill(*fp_state, prompt, fp_logits).ok());
+        ASSERT_TRUE(qmodel.model->Prefill(*q_state, prompt, q_logits).ok());
+
+        // Loose closeness bound: quantization error, not a bug detector —
+        // certified quality gates live in the offline evaluation pipeline.
+        const float tol = quant == WeightQuant::kInt8 ? 0.05f : 0.4f;
+        ExpectClose(fp_logits, q_logits, tol, "quantized logits");
+
+        // Determinism holds for quantized weights too.
+        std::unique_ptr<SequenceState> rerun_state;
+        ASSERT_TRUE(qmodel.model->CreateSequence(128, rerun_state).ok());
+        std::vector<float> rerun_logits;
+        ASSERT_TRUE(
+            qmodel.model->Prefill(*rerun_state, prompt, rerun_logits).ok());
+        EXPECT_EQ(q_logits, rerun_logits);
+    }
+}
+
 // Not a certified benchmark (tiny random model): records rough
 // tokens/second so the pipeline exists for real certified profiles.
 TEST_F(CudaParityTest, DecodeThroughputSmoke) {

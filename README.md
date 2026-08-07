@@ -111,7 +111,26 @@ artifact 化し、HF transformers FP32 を oracle として照合
   事前確保を撤廃)。prefix cache は request の `allow_prefix_cache`
   opt-in(既定 OFF、§16.2)で、chain hash は tenant/project scope を
   seed に含むため cross-scope 再利用は構造的に不可能(§16.1)。
-  refcount + LRU eviction。残る Phase 4 項目は INT8/INT4 量子化。
+  refcount + LRU eviction。
+
+  **INT8/INT4 weight-only 量子化(Phase 4)実装済み**: projection 重みを
+  load 時に量子化(INT8: per-row absmax、INT4: 128 要素 group scale +
+  nibble pack)。embed/lm_head は checkpoint dtype 維持。activation と
+  accumulation は FP32 のまま、決定性も維持。実測(Qwen2.5-0.5B、
+  RTX 3060):
+
+  - 重み VRAM: bf16 988MB → int8 約 630MB → int4 約 451MB
+  - 品質(FP32 oracle 比): int8 は argmax 3/3 維持だが greedy は途中
+    分岐(logit 摂動の複利。量子化モデルの品質判定は offline 評価
+    pipeline の責務であり、oracle 完全一致は原理的に失われる)。
+    int4 は argmax flip も 1 件発生
+  - 速度: 横ばい(148.6 → 148.4 / 142.9 tok/s)。**この構成の decode は
+    帯域律速ではなくカーネル起動オーバーヘッド律速**(実効 146GB/s ≪
+    ピーク 360GB/s)であることが判明。量子化の速度便益はより大きな
+    model か CUDA Graphs 導入(今後の課題)とセットで発現する
+
+  Phase 4 主要項目は以上で完了。今後: CUDA Graphs による起動
+  オーバーヘッド削減、offline 量子化(artifact pipeline + 品質評価)。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。

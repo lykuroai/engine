@@ -18,6 +18,27 @@
 
 using namespace lykuro::nie;
 
+#ifdef LYKURO_HAVE_CUDA
+// Parses "cuda[-int8|-int4][:device]".
+static bool ParseCudaBackend(const std::string& backend,
+                             lykuro::nie::CudaModelOptions& options) {
+    if (backend.rfind("cuda", 0) != 0) return false;
+    std::string rest = backend.substr(4);
+    if (rest.rfind("-int8", 0) == 0) {
+        options.quantization = lykuro::nie::WeightQuant::kInt8;
+        rest = rest.substr(5);
+    } else if (rest.rfind("-int4", 0) == 0) {
+        options.quantization = lykuro::nie::WeightQuant::kInt4;
+        rest = rest.substr(5);
+    }
+    if (!rest.empty() && rest[0] == ':') {
+        options.device_id = std::atoi(rest.c_str() + 1);
+    }
+    return true;
+}
+#endif
+
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
@@ -42,9 +63,14 @@ int main(int argc, char** argv) {
     std::unique_ptr<GenerativeModel> model = std::move(loaded.artifact.model);
     if (backend.rfind("cuda", 0) == 0) {
 #ifdef LYKURO_HAVE_CUDA
-        int device = backend.size() > 5 ? std::atoi(backend.c_str() + 5) : 0;
+        CudaModelOptions cuda_options;
+        if (!ParseCudaBackend(backend, cuda_options)) {
+            std::fprintf(stderr, "bad backend spec\n");
+            return 2;
+        }
         auto cuda = QwenCudaModel::Load(loaded.artifact.manifest,
-                                        *loaded.artifact.weights, device);
+                                        *loaded.artifact.weights,
+                                        cuda_options);
         if (!cuda.status.ok()) {
             std::fprintf(stderr, "cuda load failed: %s\n",
                          cuda.status.message().c_str());

@@ -47,6 +47,46 @@ __device__ inline float LoadWeight(const __nv_bfloat16* w, size_t i) {
     return __bfloat162float(w[i]);
 }
 
+// Weight accessors: uniform Load(row, i) view over f32 / bf16 / int8 /
+// int4 storage. Quantized loads dequantize in registers; accumulation
+// stays FP32 with fixed order, so quantized runs are still deterministic.
+struct F32Weight {
+    const float* w;
+    int in_dim;
+    __device__ float Load(size_t row, int i) const {
+        return w[row * in_dim + i];
+    }
+};
+struct Bf16Weight {
+    const __nv_bfloat16* w;
+    int in_dim;
+    __device__ float Load(size_t row, int i) const {
+        return __bfloat162float(w[row * in_dim + i]);
+    }
+};
+struct Int8Weight {
+    const int8_t* w;
+    const float* scales;  // [out]
+    int in_dim;
+    __device__ float Load(size_t row, int i) const {
+        return float(w[row * in_dim + i]) * scales[row];
+    }
+};
+constexpr int kQuantGroup = 128;
+struct Int4Weight {
+    const uint8_t* packed;   // two nibbles per byte, row-major
+    const float* scales;     // [out, groups_per_row]
+    int in_dim;
+    int groups_per_row;
+    __device__ float Load(size_t row, int i) const {
+        const size_t idx = row * in_dim + i;
+        const uint8_t byte = packed[idx >> 1];
+        const int nib = (idx & 1) ? (byte >> 4) : (byte & 0xF);
+        return float(nib - 8) *
+               scales[row * groups_per_row + i / kQuantGroup];
+    }
+};
+
 __device__ inline const float* KvRow(const float* pool,
                                      const int* __restrict__ table,
                                      int block_tokens, int t,
@@ -56,17 +96,15 @@ __device__ inline const float* KvRow(const float* pool,
                       kv_stride;
 }
 
-template <typename WT>
-__global__ void MatVecKernel(const WT* __restrict__ w,
-                             const float* __restrict__ x,
+template <typename W>
+__global__ void MatVecKernel(W weight, const float* __restrict__ x,
                              const float* __restrict__ bias, int in_dim,
                              float* __restrict__ y) {
     __shared__ float partial[128];
     const size_t row = blockIdx.x;
-    const WT* wr = w + row * size_t(in_dim);
     float acc = 0.0f;
     for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        acc += LoadWeight(wr, i) * x[i];
+        acc += weight.Load(row, i) * x[i];
     }
     partial[threadIdx.x] = acc;
     __syncthreads();
@@ -423,16 +461,14 @@ __global__ void BatchCombineAttentionKernel(
 // dynamically-indexed accumulator array would spill to local memory).
 constexpr int kBgemvChunk = 1024;
 
-template <typename WT, int B>
-__global__ void MatVecBatchKernel(const WT* __restrict__ w,
-                                  const float* __restrict__ x,
+template <typename W, int B>
+__global__ void MatVecBatchKernel(W weight, const float* __restrict__ x,
                                   const float* __restrict__ bias,
                                   int in_dim, float* __restrict__ y,
                                   int ldy) {
     __shared__ float wsh[kBgemvChunk];
     __shared__ float red[128];
     const size_t row = blockIdx.x;
-    const WT* wr = w + row * size_t(in_dim);
 
     float acc[B];
 #pragma unroll
@@ -441,7 +477,7 @@ __global__ void MatVecBatchKernel(const WT* __restrict__ w,
     for (int k0 = 0; k0 < in_dim; k0 += kBgemvChunk) {
         const int len = min(kBgemvChunk, in_dim - k0);
         for (int i = threadIdx.x; i < len; i += blockDim.x) {
-            wsh[i] = LoadWeight(wr, k0 + i);
+            wsh[i] = weight.Load(row, k0 + i);
         }
         __syncthreads();
         for (int i = threadIdx.x; i < len; i += blockDim.x) {
@@ -477,9 +513,8 @@ __global__ void MatVecBatchKernel(const WT* __restrict__ w,
 constexpr int kChunk = 128;
 constexpr int kGemmTile = 16;
 
-template <typename WT>
-__global__ void GemmXWtKernel(const float* __restrict__ x,
-                              const WT* __restrict__ w,
+template <typename W>
+__global__ void GemmXWtKernel(const float* __restrict__ x, W weight,
                               const float* __restrict__ bias, int n,
                               int in_dim, int out_dim,
                               float* __restrict__ c, int ldc) {
@@ -496,7 +531,7 @@ __global__ void GemmXWtKernel(const float* __restrict__ x,
         const int wrow = blockIdx.x * kGemmTile + threadIdx.y;
         ws[threadIdx.y][threadIdx.x] =
             (wrow < out_dim && kx < in_dim)
-                ? LoadWeight(w, size_t(wrow) * in_dim + kx)
+                ? weight.Load(size_t(wrow), kx)
                 : 0.0f;
         __syncthreads();
         for (int kk = 0; kk < kGemmTile; ++kk) {
@@ -664,14 +699,47 @@ struct DeviceBuffer {
 
 struct WeightBuffer {
     DeviceBuffer buf;
+    DeviceBuffer scale_buf;  // quantized modes only
     bool bf16 = false;
+    WeightQuant quant = WeightQuant::kNone;
+    int in_dim = 0;
+    int groups_per_row = 0;
 
-    Status Upload(const SafetensorsFile& file, const std::string& name) {
+    Status Upload(const SafetensorsFile& file, const std::string& name,
+                  WeightQuant want = WeightQuant::kNone) {
         const TensorInfo* info = file.FindTensor(name);
         const uint8_t* data = file.TensorData(name);
         if (info == nullptr || data == nullptr) {
             return Status(ErrorCode::kArtifactVerificationFailed,
                           "expected weight tensor missing", kComponent);
+        }
+        // Matrix geometry (vectors are never quantized here).
+        if (info->shape.size() == 2) {
+            in_dim = int(info->shape[1]);
+        }
+        if (want != WeightQuant::kNone) {
+            if (info->shape.size() != 2 || (in_dim % 2) != 0) {
+                return Status(ErrorCode::kUnsupportedModel,
+                              "weight shape unsupported for quantization",
+                              kComponent);
+            }
+            std::vector<float> host(info->element_count);
+            switch (info->dtype) {
+                case Dtype::kF32:
+                    std::memcpy(host.data(), data, info->data_size);
+                    break;
+                case Dtype::kBf16:
+                    Bf16ToFloatArray(
+                        reinterpret_cast<const uint16_t*>(data),
+                        host.data(), info->element_count);
+                    break;
+                case Dtype::kF16:
+                    Fp16ToFloatArray(
+                        reinterpret_cast<const uint16_t*>(data),
+                        host.data(), info->element_count);
+                    break;
+            }
+            return Quantize(host, size_t(info->shape[0]), want);
         }
         if (info->dtype == Dtype::kBf16) {
             bf16 = true;
@@ -694,6 +762,86 @@ struct WeightBuffer {
         if (!s.ok()) return s;
         LYKURO_CUDA_CHECK(cudaMemcpy(buf.ptr, host.data(),
                                      host.size() * sizeof(float),
+                                     cudaMemcpyHostToDevice),
+                          "weight upload failed");
+        return Status::Ok();
+    }
+
+private:
+    Status Quantize(const std::vector<float>& host, size_t out_dim,
+                    WeightQuant want) {
+        quant = want;
+        if (want == WeightQuant::kInt8) {
+            // Per-output-row absmax scale.
+            std::vector<int8_t> q(host.size());
+            std::vector<float> scales(out_dim);
+            for (size_t r = 0; r < out_dim; ++r) {
+                const float* row = host.data() + r * in_dim;
+                float absmax = 0.0f;
+                for (int i = 0; i < in_dim; ++i) {
+                    absmax = std::max(absmax, std::abs(row[i]));
+                }
+                const float scale = absmax > 0 ? absmax / 127.0f : 1.0f;
+                scales[r] = scale;
+                for (int i = 0; i < in_dim; ++i) {
+                    q[r * in_dim + i] = int8_t(std::max(
+                        -127.0f,
+                        std::min(127.0f, std::round(row[i] / scale))));
+                }
+            }
+            Status s = buf.AllocBytes(q.size());
+            if (!s.ok()) return s;
+            LYKURO_CUDA_CHECK(cudaMemcpy(buf.ptr, q.data(), q.size(),
+                                         cudaMemcpyHostToDevice),
+                              "weight upload failed");
+            s = scale_buf.AllocBytes(scales.size() * sizeof(float));
+            if (!s.ok()) return s;
+            LYKURO_CUDA_CHECK(
+                cudaMemcpy(scale_buf.ptr, scales.data(),
+                           scales.size() * sizeof(float),
+                           cudaMemcpyHostToDevice),
+                "weight upload failed");
+            return Status::Ok();
+        }
+        // INT4: per-row, per-group absmax scale; values in [-8, 7],
+        // stored as nibble + 8.
+        groups_per_row = (in_dim + kQuantGroup - 1) / kQuantGroup;
+        std::vector<uint8_t> packed(host.size() / 2);
+        std::vector<float> scales(out_dim * size_t(groups_per_row));
+        for (size_t r = 0; r < out_dim; ++r) {
+            const float* row = host.data() + r * in_dim;
+            for (int g = 0; g < groups_per_row; ++g) {
+                const int g0 = g * kQuantGroup;
+                const int g1 = std::min(in_dim, g0 + kQuantGroup);
+                float absmax = 0.0f;
+                for (int i = g0; i < g1; ++i) {
+                    absmax = std::max(absmax, std::abs(row[i]));
+                }
+                scales[r * groups_per_row + g] =
+                    absmax > 0 ? absmax / 7.0f : 1.0f;
+            }
+            for (int i = 0; i < in_dim; i += 2) {
+                auto nib = [&](int j) {
+                    const float scale =
+                        scales[r * groups_per_row + j / kQuantGroup];
+                    const int v = int(std::max(
+                        -8.0f,
+                        std::min(7.0f, std::round(row[j] / scale))));
+                    return uint8_t(v + 8);
+                };
+                packed[(r * in_dim + i) / 2] =
+                    uint8_t(nib(i) | (nib(i + 1) << 4));
+            }
+        }
+        Status s = buf.AllocBytes(packed.size());
+        if (!s.ok()) return s;
+        LYKURO_CUDA_CHECK(cudaMemcpy(buf.ptr, packed.data(), packed.size(),
+                                     cudaMemcpyHostToDevice),
+                          "weight upload failed");
+        s = scale_buf.AllocBytes(scales.size() * sizeof(float));
+        if (!s.ok()) return s;
+        LYKURO_CUDA_CHECK(cudaMemcpy(scale_buf.ptr, scales.data(),
+                                     scales.size() * sizeof(float),
                                      cudaMemcpyHostToDevice),
                           "weight upload failed");
         return Status::Ok();
@@ -731,48 +879,54 @@ Status UploadF32(const SafetensorsFile& file, const std::string& name,
     return Status::Ok();
 }
 
-void LaunchMatVec(const WeightBuffer& w, const float* x, const float* bias,
-                  int in_dim, int out_dim, float* y) {
+// Invokes fn with the correctly-typed weight accessor.
+template <typename Fn>
+void WithWeightView(const WeightBuffer& w, int in_dim, Fn&& fn) {
+    switch (w.quant) {
+        case WeightQuant::kInt8:
+            fn(Int8Weight{static_cast<const int8_t*>(w.buf.ptr),
+                          w.scale_buf.f32(), in_dim});
+            return;
+        case WeightQuant::kInt4:
+            fn(Int4Weight{static_cast<const uint8_t*>(w.buf.ptr),
+                          w.scale_buf.f32(), in_dim, w.groups_per_row});
+            return;
+        case WeightQuant::kNone:
+            break;
+    }
     if (w.bf16) {
-        MatVecKernel<__nv_bfloat16><<<out_dim, 128>>>(
-            static_cast<const __nv_bfloat16*>(w.buf.ptr), x, bias, in_dim,
-            y);
+        fn(Bf16Weight{static_cast<const __nv_bfloat16*>(w.buf.ptr),
+                      in_dim});
     } else {
-        MatVecKernel<float><<<out_dim, 128>>>(
-            static_cast<const float*>(w.buf.ptr), x, bias, in_dim, y);
+        fn(F32Weight{static_cast<const float*>(w.buf.ptr), in_dim});
     }
 }
 
-template <typename WT>
-void LaunchMatVecBatchTyped(const WT* w, const float* x, const float* bias,
-                            int batch, int in_dim, int out_dim, float* y,
-                            int ldy) {
-    if (batch <= 2) {
-        MatVecBatchKernel<WT, 2><<<out_dim, 128>>>(w, x, bias, in_dim, y,
-                                                   ldy);
-    } else if (batch <= 4) {
-        MatVecBatchKernel<WT, 4><<<out_dim, 128>>>(w, x, bias, in_dim, y,
-                                                   ldy);
-    } else if (batch <= 8) {
-        MatVecBatchKernel<WT, 8><<<out_dim, 128>>>(w, x, bias, in_dim, y,
-                                                   ldy);
-    } else {
-        MatVecBatchKernel<WT, 16><<<out_dim, 128>>>(w, x, bias, in_dim, y,
-                                                    ldy);
-    }
+void LaunchMatVec(const WeightBuffer& w, const float* x, const float* bias,
+                  int in_dim, int out_dim, float* y) {
+    WithWeightView(w, in_dim, [&](auto view) {
+        MatVecKernel<<<out_dim, 128>>>(view, x, bias, in_dim, y);
+    });
 }
 
 void LaunchMatVecBatch(const float* x, const WeightBuffer& w,
                        const float* bias, int batch, int in_dim,
                        int out_dim, float* y, int ldy) {
-    if (w.bf16) {
-        LaunchMatVecBatchTyped(
-            static_cast<const __nv_bfloat16*>(w.buf.ptr), x, bias, batch,
-            in_dim, out_dim, y, ldy);
-    } else {
-        LaunchMatVecBatchTyped(static_cast<const float*>(w.buf.ptr), x,
-                               bias, batch, in_dim, out_dim, y, ldy);
-    }
+    WithWeightView(w, in_dim, [&](auto view) {
+        if (batch <= 2) {
+            MatVecBatchKernel<decltype(view), 2>
+                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+        } else if (batch <= 4) {
+            MatVecBatchKernel<decltype(view), 4>
+                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+        } else if (batch <= 8) {
+            MatVecBatchKernel<decltype(view), 8>
+                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+        } else {
+            MatVecBatchKernel<decltype(view), 16>
+                <<<out_dim, 128>>>(view, x, bias, in_dim, y, ldy);
+        }
+    });
 }
 
 void LaunchGemm(const float* x, const WeightBuffer& w, const float* bias,
@@ -780,15 +934,10 @@ void LaunchGemm(const float* x, const WeightBuffer& w, const float* bias,
     dim3 grid((out_dim + kGemmTile - 1) / kGemmTile,
               (n + kGemmTile - 1) / kGemmTile);
     dim3 block(kGemmTile, kGemmTile);
-    if (w.bf16) {
-        GemmXWtKernel<__nv_bfloat16><<<grid, block>>>(
-            x, static_cast<const __nv_bfloat16*>(w.buf.ptr), bias, n,
-            in_dim, out_dim, c, ldc);
-    } else {
-        GemmXWtKernel<float><<<grid, block>>>(
-            x, static_cast<const float*>(w.buf.ptr), bias, n, in_dim,
-            out_dim, c, ldc);
-    }
+    WithWeightView(w, in_dim, [&](auto view) {
+        GemmXWtKernel<<<grid, block>>>(x, view, bias, n, in_dim, out_dim,
+                                       c, ldc);
+    });
 }
 
 // ------------------------------------------------------- paged KV pool
@@ -1088,6 +1237,12 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
     impl.tied = c.tie_word_embeddings;
 
     auto up_w = [&](const std::string& name, WeightBuffer& dst) {
+        if (result.status.ok()) {
+            result.status =
+                dst.Upload(weights, name, options.quantization);
+        }
+    };
+    auto up_native = [&](const std::string& name, WeightBuffer& dst) {
         if (result.status.ok()) result.status = dst.Upload(weights, name);
     };
     auto up_f = [&](const std::string& name, DeviceBuffer& dst) {
@@ -1096,7 +1251,9 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
         }
     };
 
-    up_w("model.embed_tokens.weight", impl.embed);
+    // embed / lm_head keep the checkpoint dtype: logits precision is not
+    // sacrificed to weight quantization.
+    up_native("model.embed_tokens.weight", impl.embed);
     impl.layers.resize(c.num_layers);
     for (uint32_t l = 0; l < c.num_layers; ++l) {
         const std::string p = "model.layers." + std::to_string(l) + ".";
@@ -1116,7 +1273,7 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
     }
     up_f("model.norm.weight", impl.final_norm);
     if (!c.tie_word_embeddings) {
-        up_w("lm_head.weight", impl.lm_head);
+        up_native("lm_head.weight", impl.lm_head);
     }
     if (!result.status.ok()) return result;
 

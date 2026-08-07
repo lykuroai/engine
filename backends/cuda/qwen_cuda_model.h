@@ -19,12 +19,24 @@ namespace lykuro::nie {
 // / SwiGLU. All math in FP32 (BF16/FP16 weights are widened at load).
 // Outputs must match the CPU reference within certified tolerance; the
 // parity test enforces this on real hardware.
+// Weight-only quantization (spec §2.2 Phase 2+ / Phase 4). Activations
+// and accumulation stay FP32; projection weights are quantized at load
+// (embed/lm_head keep the checkpoint dtype to preserve logits precision).
+// Production quantizes offline in the artifact pipeline with certified
+// evaluation; this runtime path is the mechanism plus dev measurement.
+enum class WeightQuant {
+    kNone,
+    kInt8,  // per-output-row absmax scale
+    kInt4,  // per-row, per-128-element-group absmax scale, nibble packed
+};
+
 struct CudaModelOptions {
     int device_id = 0;
     // Total KV pool capacity in tokens (0 = default: 4x max context) and
     // the paged-block granularity (spec §16.3 block allocator).
     uint32_t kv_pool_tokens = 0;
     uint32_t kv_block_tokens = 64;
+    WeightQuant quantization = WeightQuant::kNone;
 };
 
 class QwenCudaModel : public GenerativeModel {
