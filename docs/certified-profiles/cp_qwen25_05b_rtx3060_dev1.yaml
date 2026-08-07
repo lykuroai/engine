@@ -51,8 +51,18 @@ measured_targets:  # gateway excluded (engine-local)
 
 stability:  # see soak run results in the repo history / README
   soak_60s: { completed: 176, failed: 0, rss_drift_kb: 0, vram_drift_mb: 12 }
-  soak_600s: TO_BE_FILLED
-  reload_cycles_100: TO_BE_FILLED
+  soak_600s:
+    submitted: 1708
+    completed: 1668
+    cancelled: 40          # intentional mid-flight cancels
+    failed: 0
+    rejected: 0
+    output_tokens: 56688
+    aggregate_tokens_per_s: 94.5   # mixed load, max_sequences=8
+    rss_drift_kb: 0        # bit-identical before/after
+    vram_drift_mb: 10      # initial lazy allocations; flat vs 60s run
+  reload_cycles_100:
+    leak_mb: 0.0           # free VRAM returned to baseline exactly
 
 not_certified_reasons:
   - 24h soak not executed (10-minute soak only)
