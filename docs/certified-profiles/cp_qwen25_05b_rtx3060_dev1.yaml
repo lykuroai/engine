@@ -1,0 +1,61 @@
+# Certified Profile (DEVELOPMENT MEASUREMENT) — spec §25.1
+#
+# Status: dev-measured. All figures below were measured on the hardware
+# listed, but this profile has NOT passed the full production
+# certification gate (24h soak, formal security review, signed release).
+# It must not be presented to customers as a certified contract value.
+
+profile_id: cp_qwen25_05b_rtx3060_dev1
+status: dev_measured
+engine_version: 0.1.0
+engine_git: lykuroai/engine@main (2026-08-08)
+architecture_plugin: approved_qwen_decoder_v1
+model_artifact: Qwen2.5-0.5B-Instruct (BF16, converted via tools/convert_hf_qwen.py)
+
+hardware:
+  gpu_model: NVIDIA GeForce RTX 3060
+  gpu_count: 1
+  compute_capability: "8.6"
+  vram_gb: 12
+  driver: 570.211.01
+  cuda: 12.8
+  host_os: Ubuntu 22.04.2
+
+configuration:
+  precision: bf16 (weights resident; fp32 activations/accumulation)
+  context_tokens: 32768
+  max_sequences: 8
+  kv: paged, 64-token blocks, pool 4x context
+  decode_path: CUDA Graphs + fused kernels (batch <= 8), tiled GEMM (16)
+
+correctness:
+  oracle: HF transformers FP32, 3 prompts (EN/math/JA)
+  prefill_logits_max_diff: 6.0e-5
+  greedy_agreement: 96/96 tokens
+  determinism: bit-exact run-to-run (fixed-order reductions)
+
+measured_targets:  # gateway excluded (engine-local)
+  ttft_ms_19tok_prompt: 41
+  ttft_ms_1289tok_prompt: 2258   # prefill ~584 tok/s
+  decode_tokens_per_second:
+    batch_1: 169
+    batch_2: 242
+    batch_4: 300
+    batch_8: 335
+    batch_16: 446
+    batch_1_ctx1289: 150
+  quantized_variants:
+    int8_batch_1: 171   # argmax parity with FP32 oracle; greedy diverges
+    int4_batch_1: 143   # quality gate pending offline evaluation
+  weight_vram_mb: { bf16: 988, int8: 630, int4: 451 }
+
+stability:  # see soak run results in the repo history / README
+  soak_60s: { completed: 176, failed: 0, rss_drift_kb: 0, vram_drift_mb: 12 }
+  soak_600s: TO_BE_FILLED
+  reload_cycles_100: TO_BE_FILLED
+
+not_certified_reasons:
+  - 24h soak not executed (10-minute soak only)
+  - no formal production security review of this build
+  - unsigned dev artifact path used for measurement
+  - single-host sample; no cross-host variance data
