@@ -1,6 +1,6 @@
 #include "backends/cuda/qwen_cuda_model.h"
 
-#include <cublas_v2.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -30,17 +30,58 @@ Status CudaError(cudaError_t err, const char* what) {
         }                                                   \
     } while (0)
 
-#define LYKURO_CUBLAS_CHECK(expr, what)                                  \
-    do {                                                                 \
-        if ((expr) != CUBLAS_STATUS_SUCCESS) {                           \
-            return Status(ErrorCode::kInferenceFailed, what, kComponent); \
-        }                                                                \
-    } while (0)
-
 // ------------------------------------------------------------- kernels
+//
+// Phase 4 design: weights stay in their checkpoint dtype on device
+// (BF16 checkpoints are never widened, halving decode bandwidth) while
+// every accumulation runs in FP32 with a fixed reduction order, so
+// results are deterministic and semantically identical to the CPU
+// reference, which also computes fp32 over the same bf16 weight values.
 
-// RMSNorm over `dim` elements: one block, tree reduction (fixed blockDim
-// keeps the reduction order, and therefore the result, deterministic).
+__device__ inline float LoadWeight(const float* w, size_t i) { return w[i]; }
+__device__ inline float LoadWeight(const __nv_bfloat16* w, size_t i) {
+    return __bfloat162float(w[i]);
+}
+
+// y = W x + bias. W row-major [out_dim, in_dim]; one block per output row,
+// strided fp32 accumulation with a tree reduction (deterministic).
+template <typename WT>
+__global__ void MatVecKernel(const WT* __restrict__ w,
+                             const float* __restrict__ x,
+                             const float* __restrict__ bias, int in_dim,
+                             float* __restrict__ y) {
+    __shared__ float partial[128];
+    const size_t row = blockIdx.x;
+    const WT* wr = w + row * size_t(in_dim);
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        acc += LoadWeight(wr, i) * x[i];
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        y[row] = partial[0] + (bias != nullptr ? bias[row] : 0.0f);
+    }
+}
+
+// hidden = embed[token], converted to fp32.
+template <typename WT>
+__global__ void GatherEmbedKernel(const WT* __restrict__ embed,
+                                  uint32_t token, int hidden,
+                                  float* __restrict__ out) {
+    const WT* row = embed + size_t(token) * hidden;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hidden;
+         i += gridDim.x * blockDim.x) {
+        out[i] = LoadWeight(row, i);
+    }
+}
+
 __global__ void RmsNormKernel(const float* x, const float* weight,
                               float eps, int dim, float* out) {
     __shared__ float partial[256];
@@ -62,8 +103,6 @@ __global__ void RmsNormKernel(const float* x, const float* weight,
     }
 }
 
-// Rotate-half RoPE applied in place to `num_heads` contiguous head
-// vectors of size head_dim. grid.x = head, thread = pair index.
 __global__ void RopeKernel(float* vec, int head_dim, uint32_t pos,
                            float theta) {
     const int head = blockIdx.x;
@@ -81,10 +120,6 @@ __global__ void RopeKernel(float* vec, int head_dim, uint32_t pos,
     }
 }
 
-// Causal attention for one query position over the cached K/V.
-// grid.x = query head. `scores` is a per-head scratch row
-// [num_heads, max_context]. Softmax is computed serially by thread 0 so
-// the summation order (and result) is reproducible run to run.
 __global__ void AttentionKernel(const float* q, const float* k_cache,
                                 const float* v_cache, float* scores,
                                 float* out, int context, int head_dim,
@@ -133,7 +168,6 @@ __global__ void AttentionKernel(const float* q, const float* k_cache,
     }
 }
 
-// SwiGLU: gate = silu(gate) * up, elementwise.
 __global__ void SwigluKernel(float* gate, const float* up, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < dim) {
@@ -143,100 +177,131 @@ __global__ void SwigluKernel(float* gate, const float* up, int dim) {
     }
 }
 
-// ------------------------------------------------------ device buffers
+__global__ void AddKernel(float* y, const float* x, int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) y[i] += x[i];
+}
+
+// -------------------------------------------------------------- buffers
 
 struct DeviceBuffer {
-    float* ptr = nullptr;
+    void* ptr = nullptr;
     ~DeviceBuffer() {
         if (ptr != nullptr) cudaFree(ptr);
     }
-    Status Alloc(size_t count) {
-        LYKURO_CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(float)),
+    Status AllocBytes(size_t bytes) {
+        LYKURO_CUDA_CHECK(cudaMalloc(&ptr, bytes),
                           "device allocation failed");
         return Status::Ok();
     }
-    Status Upload(const std::vector<float>& host) {
-        Status s = Alloc(host.size());
+    float* f32() const { return static_cast<float*>(ptr); }
+};
+
+// Weight tensor kept in checkpoint dtype (bf16 or fp32).
+struct WeightBuffer {
+    DeviceBuffer buf;
+    bool bf16 = false;
+
+    // Uploads the tensor without widening BF16. F16 is widened to fp32
+    // (fp16 checkpoints are rare in the certified set; correctness over
+    // bandwidth there).
+    Status Upload(const SafetensorsFile& file, const std::string& name) {
+        const TensorInfo* info = file.FindTensor(name);
+        const uint8_t* data = file.TensorData(name);
+        if (info == nullptr || data == nullptr) {
+            return Status(ErrorCode::kArtifactVerificationFailed,
+                          "expected weight tensor missing", kComponent);
+        }
+        if (info->dtype == Dtype::kBf16) {
+            bf16 = true;
+            Status s = buf.AllocBytes(info->data_size);
+            if (!s.ok()) return s;
+            LYKURO_CUDA_CHECK(cudaMemcpy(buf.ptr, data, info->data_size,
+                                         cudaMemcpyHostToDevice),
+                              "weight upload failed");
+            return Status::Ok();
+        }
+        std::vector<float> host(info->element_count);
+        if (info->dtype == Dtype::kF32) {
+            std::memcpy(host.data(), data, info->data_size);
+        } else {
+            Fp16ToFloatArray(reinterpret_cast<const uint16_t*>(data),
+                             host.data(), info->element_count);
+        }
+        bf16 = false;
+        Status s = buf.AllocBytes(host.size() * sizeof(float));
         if (!s.ok()) return s;
-        LYKURO_CUDA_CHECK(
-            cudaMemcpy(ptr, host.data(), host.size() * sizeof(float),
-                       cudaMemcpyHostToDevice),
-            "weight upload failed");
+        LYKURO_CUDA_CHECK(cudaMemcpy(buf.ptr, host.data(),
+                                     host.size() * sizeof(float),
+                                     cudaMemcpyHostToDevice),
+                          "weight upload failed");
         return Status::Ok();
     }
 };
 
-// Converts one verified tensor to host FP32.
-Status TensorToHost(const SafetensorsFile& file, const std::string& name,
-                    std::vector<float>& out) {
+// Small vectors (norm weights, biases) are always fp32 on device.
+Status UploadF32(const SafetensorsFile& file, const std::string& name,
+                 DeviceBuffer& dst) {
     const TensorInfo* info = file.FindTensor(name);
     const uint8_t* data = file.TensorData(name);
     if (info == nullptr || data == nullptr) {
         return Status(ErrorCode::kArtifactVerificationFailed,
                       "expected weight tensor missing", kComponent);
     }
-    out.resize(info->element_count);
+    std::vector<float> host(info->element_count);
     switch (info->dtype) {
         case Dtype::kF32:
-            std::memcpy(out.data(), data, info->data_size);
+            std::memcpy(host.data(), data, info->data_size);
             break;
         case Dtype::kBf16:
             Bf16ToFloatArray(reinterpret_cast<const uint16_t*>(data),
-                             out.data(), info->element_count);
+                             host.data(), info->element_count);
             break;
         case Dtype::kF16:
             Fp16ToFloatArray(reinterpret_cast<const uint16_t*>(data),
-                             out.data(), info->element_count);
+                             host.data(), info->element_count);
             break;
     }
+    Status s = dst.AllocBytes(host.size() * sizeof(float));
+    if (!s.ok()) return s;
+    LYKURO_CUDA_CHECK(cudaMemcpy(dst.ptr, host.data(),
+                                 host.size() * sizeof(float),
+                                 cudaMemcpyHostToDevice),
+                      "weight upload failed");
     return Status::Ok();
+}
+
+void LaunchMatVec(const WeightBuffer& w, const float* x, const float* bias,
+                  int in_dim, int out_dim, float* y) {
+    if (w.bf16) {
+        MatVecKernel<__nv_bfloat16><<<out_dim, 128>>>(
+            static_cast<const __nv_bfloat16*>(w.buf.ptr), x, bias, in_dim,
+            y);
+    } else {
+        MatVecKernel<float><<<out_dim, 128>>>(
+            static_cast<const float*>(w.buf.ptr), x, bias, in_dim, y);
+    }
 }
 
 }  // namespace
 
 struct QwenCudaModel::Impl {
-    cublasHandle_t cublas = nullptr;
-
     struct Layer {
-        DeviceBuffer input_norm, q_w, q_b, k_w, k_b, v_w, v_b, o_w;
-        DeviceBuffer post_norm, gate_w, up_w, down_w;
+        DeviceBuffer input_norm, q_b, k_b, v_b, post_norm;
+        WeightBuffer q_w, k_w, v_w, o_w, gate_w, up_w, down_w;
     };
 
-    DeviceBuffer embed;
+    WeightBuffer embed;
     std::vector<Layer> layers;
     DeviceBuffer final_norm;
-    DeviceBuffer lm_head;  // unset when tied (embed is used)
+    WeightBuffer lm_head;  // unset when tied (embed is used)
+    bool tied = true;
 
-    // Shared work buffers (forward runs on one thread at a time).
     DeviceBuffer hidden, normed, q, attn_out, proj, gate, up, logits, scores;
-
-    ~Impl() {
-        if (cublas != nullptr) cublasDestroy(cublas);
-    }
-
-    // y = W x (+ bias). W is row-major [out_dim, in_dim].
-    Status MatVec(const DeviceBuffer& w, const float* bias, const float* x,
-                  int in_dim, int out_dim, float* y) {
-        float beta = 0.0f;
-        if (bias != nullptr) {
-            LYKURO_CUDA_CHECK(
-                cudaMemcpy(y, bias, out_dim * sizeof(float),
-                           cudaMemcpyDeviceToDevice),
-                "bias copy failed");
-            beta = 1.0f;
-        }
-        const float alpha = 1.0f;
-        LYKURO_CUBLAS_CHECK(
-            cublasSgemv(cublas, CUBLAS_OP_T, in_dim, out_dim, &alpha, w.ptr,
-                        in_dim, x, 1, &beta, y, 1),
-            "projection failed");
-        return Status::Ok();
-    }
 };
 
 namespace {
 
-// Device-side KV cache for one sequence.
 class CudaSequenceState final : public SequenceState {
 public:
     static Status Create(const QwenConfig& config, uint32_t max_tokens,
@@ -247,11 +312,12 @@ public:
         state->max_tokens_ = max_tokens;
         state->keys_.resize(config.num_layers);
         state->values_.resize(config.num_layers);
-        const size_t per_layer = size_t(max_tokens) * state->kv_stride_;
+        const size_t bytes =
+            size_t(max_tokens) * state->kv_stride_ * sizeof(float);
         for (uint32_t l = 0; l < config.num_layers; ++l) {
-            Status s = state->keys_[l].Alloc(per_layer);
+            Status s = state->keys_[l].AllocBytes(bytes);
             if (!s.ok()) return s;
-            s = state->values_[l].Alloc(per_layer);
+            s = state->values_[l].AllocBytes(bytes);
             if (!s.ok()) return s;
         }
         out = std::move(state);
@@ -262,13 +328,13 @@ public:
     uint32_t capacity() const override { return max_tokens_; }
 
     float* KeyAt(uint32_t layer, uint32_t token_index) {
-        return keys_[layer].ptr + size_t(token_index) * kv_stride_;
+        return keys_[layer].f32() + size_t(token_index) * kv_stride_;
     }
     float* ValueAt(uint32_t layer, uint32_t token_index) {
-        return values_[layer].ptr + size_t(token_index) * kv_stride_;
+        return values_[layer].f32() + size_t(token_index) * kv_stride_;
     }
-    float* KeyBase(uint32_t layer) { return keys_[layer].ptr; }
-    float* ValueBase(uint32_t layer) { return values_[layer].ptr; }
+    float* KeyBase(uint32_t layer) { return keys_[layer].f32(); }
+    float* ValueBase(uint32_t layer) { return values_[layer].f32(); }
     void Advance() { ++length_; }
 
 private:
@@ -305,55 +371,55 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(const ModelManifest& manifest,
     }
     model->impl_ = std::make_unique<Impl>();
     Impl& impl = *model->impl_;
-    if (cublasCreate(&impl.cublas) != CUBLAS_STATUS_SUCCESS) {
-        result.status = Status(ErrorCode::kGpuUnhealthy,
-                               "cublas initialization failed", kComponent);
-        return result;
-    }
+    impl.tied = c.tie_word_embeddings;
 
-    std::vector<float> host;
-    auto upload = [&](const std::string& name, DeviceBuffer& dst) {
-        if (!result.status.ok()) return;
-        result.status = TensorToHost(weights, name, host);
-        if (result.status.ok()) result.status = dst.Upload(host);
+    auto up_w = [&](const std::string& name, WeightBuffer& dst) {
+        if (result.status.ok()) result.status = dst.Upload(weights, name);
+    };
+    auto up_f = [&](const std::string& name, DeviceBuffer& dst) {
+        if (result.status.ok()) {
+            result.status = UploadF32(weights, name, dst);
+        }
     };
 
-    upload("model.embed_tokens.weight", impl.embed);
+    up_w("model.embed_tokens.weight", impl.embed);
     impl.layers.resize(c.num_layers);
     for (uint32_t l = 0; l < c.num_layers; ++l) {
         const std::string p = "model.layers." + std::to_string(l) + ".";
         Impl::Layer& layer = impl.layers[l];
-        upload(p + "input_layernorm.weight", layer.input_norm);
-        upload(p + "self_attn.q_proj.weight", layer.q_w);
-        upload(p + "self_attn.q_proj.bias", layer.q_b);
-        upload(p + "self_attn.k_proj.weight", layer.k_w);
-        upload(p + "self_attn.k_proj.bias", layer.k_b);
-        upload(p + "self_attn.v_proj.weight", layer.v_w);
-        upload(p + "self_attn.v_proj.bias", layer.v_b);
-        upload(p + "self_attn.o_proj.weight", layer.o_w);
-        upload(p + "post_attention_layernorm.weight", layer.post_norm);
-        upload(p + "mlp.gate_proj.weight", layer.gate_w);
-        upload(p + "mlp.up_proj.weight", layer.up_w);
-        upload(p + "mlp.down_proj.weight", layer.down_w);
+        up_f(p + "input_layernorm.weight", layer.input_norm);
+        up_w(p + "self_attn.q_proj.weight", layer.q_w);
+        up_f(p + "self_attn.q_proj.bias", layer.q_b);
+        up_w(p + "self_attn.k_proj.weight", layer.k_w);
+        up_f(p + "self_attn.k_proj.bias", layer.k_b);
+        up_w(p + "self_attn.v_proj.weight", layer.v_w);
+        up_f(p + "self_attn.v_proj.bias", layer.v_b);
+        up_w(p + "self_attn.o_proj.weight", layer.o_w);
+        up_f(p + "post_attention_layernorm.weight", layer.post_norm);
+        up_w(p + "mlp.gate_proj.weight", layer.gate_w);
+        up_w(p + "mlp.up_proj.weight", layer.up_w);
+        up_w(p + "mlp.down_proj.weight", layer.down_w);
     }
-    upload("model.norm.weight", impl.final_norm);
+    up_f("model.norm.weight", impl.final_norm);
     if (!c.tie_word_embeddings) {
-        upload("lm_head.weight", impl.lm_head);
+        up_w("lm_head.weight", impl.lm_head);
     }
     if (!result.status.ok()) return result;
 
-    // Work buffers.
     const size_t q_dim = size_t(c.num_heads) * c.head_dim;
-    Status s = impl.hidden.Alloc(c.hidden_size);
-    if (s.ok()) s = impl.normed.Alloc(c.hidden_size);
-    if (s.ok()) s = impl.q.Alloc(q_dim);
-    if (s.ok()) s = impl.attn_out.Alloc(q_dim);
-    if (s.ok()) s = impl.proj.Alloc(c.hidden_size);
-    if (s.ok()) s = impl.gate.Alloc(c.intermediate_size);
-    if (s.ok()) s = impl.up.Alloc(c.intermediate_size);
-    if (s.ok()) s = impl.logits.Alloc(c.vocab_size);
+    Status s = impl.hidden.AllocBytes(c.hidden_size * sizeof(float));
+    if (s.ok()) s = impl.normed.AllocBytes(c.hidden_size * sizeof(float));
+    if (s.ok()) s = impl.q.AllocBytes(q_dim * sizeof(float));
+    if (s.ok()) s = impl.attn_out.AllocBytes(q_dim * sizeof(float));
+    if (s.ok()) s = impl.proj.AllocBytes(c.hidden_size * sizeof(float));
     if (s.ok()) {
-        s = impl.scores.Alloc(size_t(c.num_heads) * c.max_context_tokens);
+        s = impl.gate.AllocBytes(c.intermediate_size * sizeof(float));
+    }
+    if (s.ok()) s = impl.up.AllocBytes(c.intermediate_size * sizeof(float));
+    if (s.ok()) s = impl.logits.AllocBytes(c.vocab_size * sizeof(float));
+    if (s.ok()) {
+        s = impl.scores.AllocBytes(size_t(c.num_heads) *
+                                   c.max_context_tokens * sizeof(float));
     }
     if (!s.ok()) {
         result.status = s;
@@ -389,82 +455,69 @@ Status QwenCudaModel::ForwardToken(uint32_t token, uint32_t pos,
     const int kv_dim = int(c.num_kv_heads * c.head_dim);
     const int group = int(c.num_heads / c.num_kv_heads);
     const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
+    const int threads = 256;
 
     LYKURO_CUDA_CHECK(cudaSetDevice(device_id_), "cuda device not usable");
-    LYKURO_CUDA_CHECK(
-        cudaMemcpy(impl.hidden.ptr, impl.embed.ptr + size_t(token) * h,
-                   h * sizeof(float), cudaMemcpyDeviceToDevice),
-        "embedding lookup failed");
+    if (impl.embed.bf16) {
+        GatherEmbedKernel<__nv_bfloat16><<<4, threads>>>(
+            static_cast<const __nv_bfloat16*>(impl.embed.buf.ptr), token, h,
+            impl.hidden.f32());
+    } else {
+        GatherEmbedKernel<float><<<4, threads>>>(
+            static_cast<const float*>(impl.embed.buf.ptr), token, h,
+            impl.hidden.f32());
+    }
 
-    const float one = 1.0f;
     for (uint32_t l = 0; l < c.num_layers; ++l) {
         Impl::Layer& layer = impl.layers[l];
         float* k_dst = state.KeyAt(l, pos);
         float* v_dst = state.ValueAt(l, pos);
 
-        RmsNormKernel<<<1, 256>>>(impl.hidden.ptr, layer.input_norm.ptr,
-                                  c.rms_norm_eps, h, impl.normed.ptr);
-        Status s = impl.MatVec(layer.q_w, layer.q_b.ptr, impl.normed.ptr, h,
-                               q_dim, impl.q.ptr);
-        if (s.ok()) {
-            s = impl.MatVec(layer.k_w, layer.k_b.ptr, impl.normed.ptr, h,
-                            kv_dim, k_dst);
-        }
-        if (s.ok()) {
-            s = impl.MatVec(layer.v_w, layer.v_b.ptr, impl.normed.ptr, h,
-                            kv_dim, v_dst);
-        }
-        if (!s.ok()) return s;
+        RmsNormKernel<<<1, 256>>>(impl.hidden.f32(), layer.input_norm.f32(),
+                                  c.rms_norm_eps, h, impl.normed.f32());
+        LaunchMatVec(layer.q_w, impl.normed.f32(), layer.q_b.f32(), h,
+                     q_dim, impl.q.f32());
+        LaunchMatVec(layer.k_w, impl.normed.f32(), layer.k_b.f32(), h,
+                     kv_dim, k_dst);
+        LaunchMatVec(layer.v_w, impl.normed.f32(), layer.v_b.f32(), h,
+                     kv_dim, v_dst);
 
-        RopeKernel<<<c.num_heads, 32>>>(impl.q.ptr, int(c.head_dim), pos,
+        RopeKernel<<<c.num_heads, 32>>>(impl.q.f32(), int(c.head_dim), pos,
                                         c.rope_theta);
         RopeKernel<<<c.num_kv_heads, 32>>>(k_dst, int(c.head_dim), pos,
                                            c.rope_theta);
         AttentionKernel<<<c.num_heads, 128>>>(
-            impl.q.ptr, state.KeyBase(l), state.ValueBase(l),
-            impl.scores.ptr, impl.attn_out.ptr, int(pos + 1),
+            impl.q.f32(), state.KeyBase(l), state.ValueBase(l),
+            impl.scores.f32(), impl.attn_out.f32(), int(pos + 1),
             int(c.head_dim), kv_dim, group, int(c.max_context_tokens),
             attn_scale);
 
-        s = impl.MatVec(layer.o_w, nullptr, impl.attn_out.ptr, q_dim, h,
-                        impl.proj.ptr);
-        if (!s.ok()) return s;
-        LYKURO_CUBLAS_CHECK(
-            cublasSaxpy(impl.cublas, h, &one, impl.proj.ptr, 1,
-                        impl.hidden.ptr, 1),
-            "residual add failed");
+        LaunchMatVec(layer.o_w, impl.attn_out.f32(), nullptr, q_dim, h,
+                     impl.proj.f32());
+        AddKernel<<<(h + threads - 1) / threads, threads>>>(
+            impl.hidden.f32(), impl.proj.f32(), h);
 
-        RmsNormKernel<<<1, 256>>>(impl.hidden.ptr, layer.post_norm.ptr,
-                                  c.rms_norm_eps, h, impl.normed.ptr);
-        s = impl.MatVec(layer.gate_w, nullptr, impl.normed.ptr, h,
-                        int(c.intermediate_size), impl.gate.ptr);
-        if (s.ok()) {
-            s = impl.MatVec(layer.up_w, nullptr, impl.normed.ptr, h,
-                            int(c.intermediate_size), impl.up.ptr);
-        }
-        if (!s.ok()) return s;
-        const int threads = 256;
-        const int blocks =
-            (int(c.intermediate_size) + threads - 1) / threads;
-        SwigluKernel<<<blocks, threads>>>(impl.gate.ptr, impl.up.ptr,
-                                          int(c.intermediate_size));
-        s = impl.MatVec(layer.down_w, nullptr, impl.gate.ptr,
-                        int(c.intermediate_size), h, impl.proj.ptr);
-        if (!s.ok()) return s;
-        LYKURO_CUBLAS_CHECK(
-            cublasSaxpy(impl.cublas, h, &one, impl.proj.ptr, 1,
-                        impl.hidden.ptr, 1),
-            "residual add failed");
+        RmsNormKernel<<<1, 256>>>(impl.hidden.f32(), layer.post_norm.f32(),
+                                  c.rms_norm_eps, h, impl.normed.f32());
+        LaunchMatVec(layer.gate_w, impl.normed.f32(), nullptr, h,
+                     int(c.intermediate_size), impl.gate.f32());
+        LaunchMatVec(layer.up_w, impl.normed.f32(), nullptr, h,
+                     int(c.intermediate_size), impl.up.f32());
+        SwigluKernel<<<(int(c.intermediate_size) + threads - 1) / threads,
+                       threads>>>(impl.gate.f32(), impl.up.f32(),
+                                  int(c.intermediate_size));
+        LaunchMatVec(layer.down_w, impl.gate.f32(), nullptr,
+                     int(c.intermediate_size), h, impl.proj.f32());
+        AddKernel<<<(h + threads - 1) / threads, threads>>>(
+            impl.hidden.f32(), impl.proj.f32(), h);
     }
 
     if (want_logits) {
-        RmsNormKernel<<<1, 256>>>(impl.hidden.ptr, impl.final_norm.ptr,
-                                  c.rms_norm_eps, h, impl.normed.ptr);
-        const DeviceBuffer& head =
-            c.tie_word_embeddings ? impl.embed : impl.lm_head;
-        Status s = impl.MatVec(head, nullptr, impl.normed.ptr, h,
-                               int(c.vocab_size), impl.logits.ptr);
-        if (!s.ok()) return s;
+        RmsNormKernel<<<1, 256>>>(impl.hidden.f32(), impl.final_norm.f32(),
+                                  c.rms_norm_eps, h, impl.normed.f32());
+        const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+        LaunchMatVec(head, impl.normed.f32(), nullptr, h,
+                     int(c.vocab_size), impl.logits.f32());
         logits_out.resize(c.vocab_size);
         LYKURO_CUDA_CHECK(
             cudaMemcpy(logits_out.data(), impl.logits.ptr,
@@ -478,9 +531,13 @@ Status QwenCudaModel::ForwardToken(uint32_t token, uint32_t pos,
                               kComponent);
             }
         }
+        // cudaMemcpy above already synchronized the stream.
+        LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
+        return Status::Ok();
     }
+    // Prefill fast path: no host sync per token; launches queue on the
+    // stream and errors surface at the next logits download.
     LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
-    LYKURO_CUDA_CHECK(cudaDeviceSynchronize(), "device execution failed");
     return Status::Ok();
 }
 

@@ -77,10 +77,19 @@ artifact 化し、HF transformers FP32 を oracle として照合
 
 ## 未実装・未検証(spec §35 に基づく明示)
 
-- **certified profile の性能数値**: CUDA backend は correctness-first
-  実装(token 逐次 forward、fused kernel なし)で、0.5B 実モデルの
-  decode はおおむね 18 tok/s 程度(RTX 3060、参考値)。performance
-  最適化と certified profile 発行は Phase 4。
+- **certified profile の正式発行**: Phase 4 最適化(bf16 weight 常駐 +
+  fp32 accumulate 自前 GEMV、cuBLAS 撤去)後の実測(Qwen2.5-0.5B、
+  single sequence、dev 計測値):
+
+  | Device | TTFT(18 tok prompt) | decode tok/s |
+  |---|---|---|
+  | RTX 3060(sm_86) | 85 ms | 134 |
+  | GTX 1650(sm_75) | 190 ms | 67 |
+
+  最適化前(fp32 weight + cuBLAS SGEMV)は約 18 tok/s。数値は §25.3
+  の完全な benchmark(concurrent / soak / saturation)を経ていないため
+  certified profile としては未発行。prefill の GEMM 化・multi-sequence
+  batched decode・paged KV・量子化は今後の Phase 4 継続項目。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。
