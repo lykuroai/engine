@@ -1,6 +1,7 @@
 find_package(GTest REQUIRED)
 
 add_executable(unit_tests
+    unit/config_test.cpp
     unit/json_test.cpp
     unit/sha256_test.cpp
     unit/signature_test.cpp

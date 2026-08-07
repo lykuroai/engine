@@ -1,4 +1,5 @@
 add_library(lykuro_core STATIC
+    engine/config.cpp
     engine/error.cpp
     engine/json.cpp
     generation/sampler.cpp
