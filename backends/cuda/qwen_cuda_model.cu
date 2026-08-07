@@ -1,0 +1,534 @@
+#include "backends/cuda/qwen_cuda_model.h"
+
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <cstring>
+#include <string>
+
+#include "backends/cpu/cpu_backend.h"
+
+namespace lykuro::nie {
+
+namespace {
+
+constexpr const char kComponent[] = "qwen_cuda";
+
+Status CudaError(cudaError_t err, const char* what) {
+    if (err == cudaErrorMemoryAllocation) {
+        return Status(ErrorCode::kGpuOom, what, kComponent);
+    }
+    return Status(ErrorCode::kGpuUnhealthy, what, kComponent);
+}
+
+#define LYKURO_CUDA_CHECK(expr, what)                       \
+    do {                                                    \
+        cudaError_t lykuro_err_ = (expr);                   \
+        if (lykuro_err_ != cudaSuccess) {                   \
+            return CudaError(lykuro_err_, what);            \
+        }                                                   \
+    } while (0)
+
+#define LYKURO_CUBLAS_CHECK(expr, what)                                  \
+    do {                                                                 \
+        if ((expr) != CUBLAS_STATUS_SUCCESS) {                           \
+            return Status(ErrorCode::kInferenceFailed, what, kComponent); \
+        }                                                                \
+    } while (0)
+
+// ------------------------------------------------------------- kernels
+
+// RMSNorm over `dim` elements: one block, tree reduction (fixed blockDim
+// keeps the reduction order, and therefore the result, deterministic).
+__global__ void RmsNormKernel(const float* x, const float* weight,
+                              float eps, int dim, float* out) {
+    __shared__ float partial[256];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        local += x[i] * x[i];
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / float(dim) + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        out[i] = x[i] * scale * weight[i];
+    }
+}
+
+// Rotate-half RoPE applied in place to `num_heads` contiguous head
+// vectors of size head_dim. grid.x = head, thread = pair index.
+__global__ void RopeKernel(float* vec, int head_dim, uint32_t pos,
+                           float theta) {
+    const int head = blockIdx.x;
+    const int half = head_dim / 2;
+    float* h = vec + head * head_dim;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = powf(theta, -2.0f * float(i) / float(head_dim));
+        float angle = float(pos) * freq;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        float a = h[i];
+        float b = h[i + half];
+        h[i] = a * c - b * s;
+        h[i + half] = b * c + a * s;
+    }
+}
+
+// Causal attention for one query position over the cached K/V.
+// grid.x = query head. `scores` is a per-head scratch row
+// [num_heads, max_context]. Softmax is computed serially by thread 0 so
+// the summation order (and result) is reproducible run to run.
+__global__ void AttentionKernel(const float* q, const float* k_cache,
+                                const float* v_cache, float* scores,
+                                float* out, int context, int head_dim,
+                                int kv_stride, int group, int max_context,
+                                float scale) {
+    const int head = blockIdx.x;
+    const int kv_head = head / group;
+    const float* qh = q + head * head_dim;
+    float* row = scores + size_t(head) * max_context;
+
+    for (int t = threadIdx.x; t < context; t += blockDim.x) {
+        const float* kt = k_cache + size_t(t) * kv_stride +
+                          kv_head * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += qh[d] * kt[d];
+        }
+        row[t] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float denom_s;
+    if (threadIdx.x == 0) {
+        float max_score = row[0];
+        for (int t = 1; t < context; ++t) {
+            max_score = fmaxf(max_score, row[t]);
+        }
+        float denom = 0.0f;
+        for (int t = 0; t < context; ++t) {
+            row[t] = expf(row[t] - max_score);
+            denom += row[t];
+        }
+        denom_s = denom;
+    }
+    __syncthreads();
+
+    float* oh = out + head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < context; ++t) {
+            const float* vt = v_cache + size_t(t) * kv_stride +
+                              kv_head * head_dim;
+            acc += (row[t] / denom_s) * vt[d];
+        }
+        oh[d] = acc;
+    }
+}
+
+// SwiGLU: gate = silu(gate) * up, elementwise.
+__global__ void SwigluKernel(float* gate, const float* up, int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) {
+        float x = gate[i];
+        float silu = x / (1.0f + expf(-x));
+        gate[i] = silu * up[i];
+    }
+}
+
+// ------------------------------------------------------ device buffers
+
+struct DeviceBuffer {
+    float* ptr = nullptr;
+    ~DeviceBuffer() {
+        if (ptr != nullptr) cudaFree(ptr);
+    }
+    Status Alloc(size_t count) {
+        LYKURO_CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(float)),
+                          "device allocation failed");
+        return Status::Ok();
+    }
+    Status Upload(const std::vector<float>& host) {
+        Status s = Alloc(host.size());
+        if (!s.ok()) return s;
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(ptr, host.data(), host.size() * sizeof(float),
+                       cudaMemcpyHostToDevice),
+            "weight upload failed");
+        return Status::Ok();
+    }
+};
+
+// Converts one verified tensor to host FP32.
+Status TensorToHost(const SafetensorsFile& file, const std::string& name,
+                    std::vector<float>& out) {
+    const TensorInfo* info = file.FindTensor(name);
+    const uint8_t* data = file.TensorData(name);
+    if (info == nullptr || data == nullptr) {
+        return Status(ErrorCode::kArtifactVerificationFailed,
+                      "expected weight tensor missing", kComponent);
+    }
+    out.resize(info->element_count);
+    switch (info->dtype) {
+        case Dtype::kF32:
+            std::memcpy(out.data(), data, info->data_size);
+            break;
+        case Dtype::kBf16:
+            Bf16ToFloatArray(reinterpret_cast<const uint16_t*>(data),
+                             out.data(), info->element_count);
+            break;
+        case Dtype::kF16:
+            Fp16ToFloatArray(reinterpret_cast<const uint16_t*>(data),
+                             out.data(), info->element_count);
+            break;
+    }
+    return Status::Ok();
+}
+
+}  // namespace
+
+struct QwenCudaModel::Impl {
+    cublasHandle_t cublas = nullptr;
+
+    struct Layer {
+        DeviceBuffer input_norm, q_w, q_b, k_w, k_b, v_w, v_b, o_w;
+        DeviceBuffer post_norm, gate_w, up_w, down_w;
+    };
+
+    DeviceBuffer embed;
+    std::vector<Layer> layers;
+    DeviceBuffer final_norm;
+    DeviceBuffer lm_head;  // unset when tied (embed is used)
+
+    // Shared work buffers (forward runs on one thread at a time).
+    DeviceBuffer hidden, normed, q, attn_out, proj, gate, up, logits, scores;
+
+    ~Impl() {
+        if (cublas != nullptr) cublasDestroy(cublas);
+    }
+
+    // y = W x (+ bias). W is row-major [out_dim, in_dim].
+    Status MatVec(const DeviceBuffer& w, const float* bias, const float* x,
+                  int in_dim, int out_dim, float* y) {
+        float beta = 0.0f;
+        if (bias != nullptr) {
+            LYKURO_CUDA_CHECK(
+                cudaMemcpy(y, bias, out_dim * sizeof(float),
+                           cudaMemcpyDeviceToDevice),
+                "bias copy failed");
+            beta = 1.0f;
+        }
+        const float alpha = 1.0f;
+        LYKURO_CUBLAS_CHECK(
+            cublasSgemv(cublas, CUBLAS_OP_T, in_dim, out_dim, &alpha, w.ptr,
+                        in_dim, x, 1, &beta, y, 1),
+            "projection failed");
+        return Status::Ok();
+    }
+};
+
+namespace {
+
+// Device-side KV cache for one sequence.
+class CudaSequenceState final : public SequenceState {
+public:
+    static Status Create(const QwenConfig& config, uint32_t max_tokens,
+                         std::unique_ptr<CudaSequenceState>& out) {
+        auto state = std::unique_ptr<CudaSequenceState>(
+            new CudaSequenceState());
+        state->kv_stride_ = config.num_kv_heads * config.head_dim;
+        state->max_tokens_ = max_tokens;
+        state->keys_.resize(config.num_layers);
+        state->values_.resize(config.num_layers);
+        const size_t per_layer = size_t(max_tokens) * state->kv_stride_;
+        for (uint32_t l = 0; l < config.num_layers; ++l) {
+            Status s = state->keys_[l].Alloc(per_layer);
+            if (!s.ok()) return s;
+            s = state->values_[l].Alloc(per_layer);
+            if (!s.ok()) return s;
+        }
+        out = std::move(state);
+        return Status::Ok();
+    }
+
+    uint32_t length() const override { return length_; }
+    uint32_t capacity() const override { return max_tokens_; }
+
+    float* KeyAt(uint32_t layer, uint32_t token_index) {
+        return keys_[layer].ptr + size_t(token_index) * kv_stride_;
+    }
+    float* ValueAt(uint32_t layer, uint32_t token_index) {
+        return values_[layer].ptr + size_t(token_index) * kv_stride_;
+    }
+    float* KeyBase(uint32_t layer) { return keys_[layer].ptr; }
+    float* ValueBase(uint32_t layer) { return values_[layer].ptr; }
+    void Advance() { ++length_; }
+
+private:
+    CudaSequenceState() = default;
+    uint32_t kv_stride_ = 0;
+    uint32_t max_tokens_ = 0;
+    uint32_t length_ = 0;
+    std::vector<DeviceBuffer> keys_;
+    std::vector<DeviceBuffer> values_;
+};
+
+}  // namespace
+
+QwenCudaModel::~QwenCudaModel() = default;
+
+QwenCudaModel::LoadResult QwenCudaModel::Load(const ModelManifest& manifest,
+                                              const SafetensorsFile& weights,
+                                              int device_id) {
+    LoadResult result;
+    auto model = std::unique_ptr<QwenCudaModel>(new QwenCudaModel());
+
+    result.status = QwenConfig::FromManifest(manifest, model->config_);
+    if (!result.status.ok()) return result;
+    const QwenConfig& c = model->config_;
+    model->limits_.vocab_size = c.vocab_size;
+    model->limits_.max_context_tokens = c.max_context_tokens;
+    model->limits_.eos_token_ids = c.eos_token_ids;
+    model->device_id_ = device_id;
+
+    if (cudaSetDevice(device_id) != cudaSuccess) {
+        result.status = Status(ErrorCode::kGpuUnhealthy,
+                               "cuda device not usable", kComponent);
+        return result;
+    }
+    model->impl_ = std::make_unique<Impl>();
+    Impl& impl = *model->impl_;
+    if (cublasCreate(&impl.cublas) != CUBLAS_STATUS_SUCCESS) {
+        result.status = Status(ErrorCode::kGpuUnhealthy,
+                               "cublas initialization failed", kComponent);
+        return result;
+    }
+
+    std::vector<float> host;
+    auto upload = [&](const std::string& name, DeviceBuffer& dst) {
+        if (!result.status.ok()) return;
+        result.status = TensorToHost(weights, name, host);
+        if (result.status.ok()) result.status = dst.Upload(host);
+    };
+
+    upload("model.embed_tokens.weight", impl.embed);
+    impl.layers.resize(c.num_layers);
+    for (uint32_t l = 0; l < c.num_layers; ++l) {
+        const std::string p = "model.layers." + std::to_string(l) + ".";
+        Impl::Layer& layer = impl.layers[l];
+        upload(p + "input_layernorm.weight", layer.input_norm);
+        upload(p + "self_attn.q_proj.weight", layer.q_w);
+        upload(p + "self_attn.q_proj.bias", layer.q_b);
+        upload(p + "self_attn.k_proj.weight", layer.k_w);
+        upload(p + "self_attn.k_proj.bias", layer.k_b);
+        upload(p + "self_attn.v_proj.weight", layer.v_w);
+        upload(p + "self_attn.v_proj.bias", layer.v_b);
+        upload(p + "self_attn.o_proj.weight", layer.o_w);
+        upload(p + "post_attention_layernorm.weight", layer.post_norm);
+        upload(p + "mlp.gate_proj.weight", layer.gate_w);
+        upload(p + "mlp.up_proj.weight", layer.up_w);
+        upload(p + "mlp.down_proj.weight", layer.down_w);
+    }
+    upload("model.norm.weight", impl.final_norm);
+    if (!c.tie_word_embeddings) {
+        upload("lm_head.weight", impl.lm_head);
+    }
+    if (!result.status.ok()) return result;
+
+    // Work buffers.
+    const size_t q_dim = size_t(c.num_heads) * c.head_dim;
+    Status s = impl.hidden.Alloc(c.hidden_size);
+    if (s.ok()) s = impl.normed.Alloc(c.hidden_size);
+    if (s.ok()) s = impl.q.Alloc(q_dim);
+    if (s.ok()) s = impl.attn_out.Alloc(q_dim);
+    if (s.ok()) s = impl.proj.Alloc(c.hidden_size);
+    if (s.ok()) s = impl.gate.Alloc(c.intermediate_size);
+    if (s.ok()) s = impl.up.Alloc(c.intermediate_size);
+    if (s.ok()) s = impl.logits.Alloc(c.vocab_size);
+    if (s.ok()) {
+        s = impl.scores.Alloc(size_t(c.num_heads) * c.max_context_tokens);
+    }
+    if (!s.ok()) {
+        result.status = s;
+        return result;
+    }
+
+    result.model = std::move(model);
+    return result;
+}
+
+Status QwenCudaModel::CreateSequence(uint32_t max_tokens,
+                                     std::unique_ptr<SequenceState>& out) {
+    if (cudaSetDevice(device_id_) != cudaSuccess) {
+        return Status(ErrorCode::kGpuUnhealthy, "cuda device not usable",
+                      kComponent);
+    }
+    std::unique_ptr<CudaSequenceState> state;
+    Status s = CudaSequenceState::Create(config_, max_tokens, state);
+    if (!s.ok()) return s;
+    out = std::move(state);
+    return Status::Ok();
+}
+
+Status QwenCudaModel::ForwardToken(uint32_t token, uint32_t pos,
+                                   void* sequence_state,
+                                   std::vector<float>& logits_out,
+                                   bool want_logits) {
+    auto& state = *static_cast<CudaSequenceState*>(sequence_state);
+    const QwenConfig& c = config_;
+    Impl& impl = *impl_;
+    const int h = int(c.hidden_size);
+    const int q_dim = int(c.num_heads * c.head_dim);
+    const int kv_dim = int(c.num_kv_heads * c.head_dim);
+    const int group = int(c.num_heads / c.num_kv_heads);
+    const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
+
+    LYKURO_CUDA_CHECK(cudaSetDevice(device_id_), "cuda device not usable");
+    LYKURO_CUDA_CHECK(
+        cudaMemcpy(impl.hidden.ptr, impl.embed.ptr + size_t(token) * h,
+                   h * sizeof(float), cudaMemcpyDeviceToDevice),
+        "embedding lookup failed");
+
+    const float one = 1.0f;
+    for (uint32_t l = 0; l < c.num_layers; ++l) {
+        Impl::Layer& layer = impl.layers[l];
+        float* k_dst = state.KeyAt(l, pos);
+        float* v_dst = state.ValueAt(l, pos);
+
+        RmsNormKernel<<<1, 256>>>(impl.hidden.ptr, layer.input_norm.ptr,
+                                  c.rms_norm_eps, h, impl.normed.ptr);
+        Status s = impl.MatVec(layer.q_w, layer.q_b.ptr, impl.normed.ptr, h,
+                               q_dim, impl.q.ptr);
+        if (s.ok()) {
+            s = impl.MatVec(layer.k_w, layer.k_b.ptr, impl.normed.ptr, h,
+                            kv_dim, k_dst);
+        }
+        if (s.ok()) {
+            s = impl.MatVec(layer.v_w, layer.v_b.ptr, impl.normed.ptr, h,
+                            kv_dim, v_dst);
+        }
+        if (!s.ok()) return s;
+
+        RopeKernel<<<c.num_heads, 32>>>(impl.q.ptr, int(c.head_dim), pos,
+                                        c.rope_theta);
+        RopeKernel<<<c.num_kv_heads, 32>>>(k_dst, int(c.head_dim), pos,
+                                           c.rope_theta);
+        AttentionKernel<<<c.num_heads, 128>>>(
+            impl.q.ptr, state.KeyBase(l), state.ValueBase(l),
+            impl.scores.ptr, impl.attn_out.ptr, int(pos + 1),
+            int(c.head_dim), kv_dim, group, int(c.max_context_tokens),
+            attn_scale);
+
+        s = impl.MatVec(layer.o_w, nullptr, impl.attn_out.ptr, q_dim, h,
+                        impl.proj.ptr);
+        if (!s.ok()) return s;
+        LYKURO_CUBLAS_CHECK(
+            cublasSaxpy(impl.cublas, h, &one, impl.proj.ptr, 1,
+                        impl.hidden.ptr, 1),
+            "residual add failed");
+
+        RmsNormKernel<<<1, 256>>>(impl.hidden.ptr, layer.post_norm.ptr,
+                                  c.rms_norm_eps, h, impl.normed.ptr);
+        s = impl.MatVec(layer.gate_w, nullptr, impl.normed.ptr, h,
+                        int(c.intermediate_size), impl.gate.ptr);
+        if (s.ok()) {
+            s = impl.MatVec(layer.up_w, nullptr, impl.normed.ptr, h,
+                            int(c.intermediate_size), impl.up.ptr);
+        }
+        if (!s.ok()) return s;
+        const int threads = 256;
+        const int blocks =
+            (int(c.intermediate_size) + threads - 1) / threads;
+        SwigluKernel<<<blocks, threads>>>(impl.gate.ptr, impl.up.ptr,
+                                          int(c.intermediate_size));
+        s = impl.MatVec(layer.down_w, nullptr, impl.gate.ptr,
+                        int(c.intermediate_size), h, impl.proj.ptr);
+        if (!s.ok()) return s;
+        LYKURO_CUBLAS_CHECK(
+            cublasSaxpy(impl.cublas, h, &one, impl.proj.ptr, 1,
+                        impl.hidden.ptr, 1),
+            "residual add failed");
+    }
+
+    if (want_logits) {
+        RmsNormKernel<<<1, 256>>>(impl.hidden.ptr, impl.final_norm.ptr,
+                                  c.rms_norm_eps, h, impl.normed.ptr);
+        const DeviceBuffer& head =
+            c.tie_word_embeddings ? impl.embed : impl.lm_head;
+        Status s = impl.MatVec(head, nullptr, impl.normed.ptr, h,
+                               int(c.vocab_size), impl.logits.ptr);
+        if (!s.ok()) return s;
+        logits_out.resize(c.vocab_size);
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(logits_out.data(), impl.logits.ptr,
+                       c.vocab_size * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "logits download failed");
+        for (float v : logits_out) {
+            if (!std::isfinite(v)) {
+                return Status(ErrorCode::kInferenceFailed,
+                              "logits contain non-finite values",
+                              kComponent);
+            }
+        }
+    }
+    LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
+    LYKURO_CUDA_CHECK(cudaDeviceSynchronize(), "device execution failed");
+    return Status::Ok();
+}
+
+Status QwenCudaModel::Prefill(SequenceState& state,
+                              const std::vector<uint32_t>& tokens,
+                              std::vector<float>& logits) {
+    auto& seq = static_cast<CudaSequenceState&>(state);
+    if (tokens.empty()) {
+        return Status(ErrorCode::kInvalidRequest, "empty prompt", kComponent);
+    }
+    if (seq.length() != 0) {
+        return Status(ErrorCode::kInternalError,
+                      "prefill requires an empty cache", kComponent);
+    }
+    if (tokens.size() > seq.capacity()) {
+        return Status(ErrorCode::kContextLengthExceeded,
+                      "prompt exceeds cache capacity", kComponent);
+    }
+    for (uint32_t t : tokens) {
+        if (t >= config_.vocab_size) {
+            return Status(ErrorCode::kInvalidRequest,
+                          "token id out of vocab range", kComponent);
+        }
+    }
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const bool last = i + 1 == tokens.size();
+        Status s = ForwardToken(tokens[i], uint32_t(i), &seq, logits, last);
+        if (!s.ok()) return s;
+        seq.Advance();
+    }
+    return Status::Ok();
+}
+
+Status QwenCudaModel::Decode(SequenceState& state, uint32_t token,
+                             std::vector<float>& logits) {
+    auto& seq = static_cast<CudaSequenceState&>(state);
+    if (token >= config_.vocab_size) {
+        return Status(ErrorCode::kInvalidRequest,
+                      "token id out of vocab range", kComponent);
+    }
+    if (seq.length() >= seq.capacity()) {
+        return Status(ErrorCode::kContextLengthExceeded,
+                      "kv cache capacity exhausted", kComponent);
+    }
+    Status s = ForwardToken(token, seq.length(), &seq, logits, true);
+    if (!s.ok()) return s;
+    seq.Advance();
+    return Status::Ok();
+}
+
+}  // namespace lykuro::nie

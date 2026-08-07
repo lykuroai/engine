@@ -28,7 +28,7 @@ std::string_view FinishReasonName(FinishReason reason) {
     return "error";
 }
 
-InferenceEngine::InferenceEngine(std::unique_ptr<QwenModel> model,
+InferenceEngine::InferenceEngine(std::unique_ptr<GenerativeModel> model,
                                  std::unique_ptr<BpeTokenizer> tokenizer,
                                  EngineConfig config, Clock clock)
     : model_(std::move(model)),
@@ -152,7 +152,7 @@ InferenceEngine::SubmitResult InferenceEngine::SubmitImpl(
 
     result.status = CheckTokenBudget(scheduled.prompt_tokens.size(),
                                      request.max_output_tokens,
-                                     model_->config().max_context_tokens);
+                                     model_->limits().max_context_tokens);
     if (!result.status.ok()) return result;
 
     auto channel =
@@ -374,8 +374,8 @@ void InferenceEngine::AdmitPending(int64_t now) {
         ActiveSequence seq;
         seq.request = std::move(next);
         seq.channel = channel;
-        seq.cache = std::make_unique<QwenKvCache>(
-            model_->config(), model_->config().max_context_tokens);
+        Status create = model_->CreateSequence(
+            model_->limits().max_context_tokens, seq.state);
         seq.sampler = std::make_unique<Sampler>(seq.request->sampling);
         seq.stop_matcher =
             std::make_unique<StopMatcher>(seq.request->stop_sequences);
@@ -388,8 +388,11 @@ void InferenceEngine::AdmitPending(int64_t now) {
         started.kind = StreamEvent::Kind::kStarted;
         Emit(seq, std::move(started));
 
-        Status s = model_->Prefill(seq.request->prompt_tokens, *seq.cache,
-                                   seq.logits);
+        Status s = std::move(create);
+        if (s.ok()) {
+            s = model_->Prefill(*seq.state, seq.request->prompt_tokens,
+                                seq.logits);
+        }
         active_.push_back(std::move(seq));
         if (!s.ok()) {
             FailSequence(active_.size() - 1, std::move(s));
@@ -431,7 +434,7 @@ void InferenceEngine::DecodeIteration(int64_t now) {
         }
         ++seq.output_tokens;
 
-        const auto& eos = model_->config().eos_token_ids;
+        const auto& eos = model_->limits().eos_token_ids;
         if (std::find(eos.begin(), eos.end(), token) != eos.end()) {
             FinishSequence(index, FinishReason::kStop);
             continue;
@@ -461,7 +464,7 @@ void InferenceEngine::DecodeIteration(int64_t now) {
             continue;
         }
 
-        s = model_->Decode(token, *seq.cache, seq.logits);
+        s = model_->Decode(*seq.state, token, seq.logits);
         if (!s.ok()) {
             FailSequence(index, std::move(s));
             continue;

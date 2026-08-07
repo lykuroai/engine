@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/engine/error.h"
+#include "model/architectures/generative_model.h"
 #include "model/loader/safetensors.h"
 #include "model/manifest/manifest.h"
 
@@ -60,7 +61,7 @@ private:
     std::vector<std::vector<float>> values_;  // per layer
 };
 
-class QwenModel {
+class QwenModel : public GenerativeModel {
 public:
     struct LoadResult;
 
@@ -70,6 +71,15 @@ public:
                            const SafetensorsFile& weights);
 
     const QwenConfig& config() const { return config_; }
+
+    // GenerativeModel interface.
+    const ModelLimits& limits() const override { return limits_; }
+    Status CreateSequence(uint32_t max_tokens,
+                          std::unique_ptr<SequenceState>& out) override;
+    Status Prefill(SequenceState& state, const std::vector<uint32_t>& tokens,
+                   std::vector<float>& logits) override;
+    Status Decode(SequenceState& state, uint32_t token,
+                  std::vector<float>& logits) override;
 
     // Runs the prompt through the model, filling `cache` and returning
     // logits for the last position. Detects NaN/Inf in logits.
@@ -104,6 +114,7 @@ private:
                             std::vector<float>& logits) const;
 
     QwenConfig config_;
+    ModelLimits limits_;
     std::vector<float> embed_tokens_;  // [vocab, hidden]
     std::vector<Layer> layers_;
     std::vector<float> final_norm_;    // [hidden]

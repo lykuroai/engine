@@ -150,6 +150,9 @@ QwenModel::LoadResult QwenModel::Load(const ModelManifest& manifest,
     result.status = QwenConfig::FromManifest(manifest, model->config_);
     if (!result.status.ok()) return result;
     const QwenConfig& c = model->config_;
+    model->limits_.vocab_size = c.vocab_size;
+    model->limits_.max_context_tokens = c.max_context_tokens;
+    model->limits_.eos_token_ids = c.eos_token_ids;
 
     const uint64_t hidden = c.hidden_size;
     const uint64_t q_dim = uint64_t(c.num_heads) * c.head_dim;
@@ -354,6 +357,42 @@ Status QwenModel::Prefill(const std::vector<uint32_t>& tokens,
         cache.Advance(1);
     }
     return LogitsFromHidden(hidden, logits);
+}
+
+namespace {
+
+// SequenceState wrapper for the host-side KV cache.
+class CpuSequenceState final : public SequenceState {
+public:
+    CpuSequenceState(const QwenConfig& config, uint32_t max_tokens)
+        : cache_(config, max_tokens) {}
+    uint32_t length() const override { return cache_.length(); }
+    uint32_t capacity() const override { return cache_.capacity(); }
+    QwenKvCache& cache() { return cache_; }
+
+private:
+    QwenKvCache cache_;
+};
+
+}  // namespace
+
+Status QwenModel::CreateSequence(uint32_t max_tokens,
+                                 std::unique_ptr<SequenceState>& out) {
+    out = std::make_unique<CpuSequenceState>(config_, max_tokens);
+    return Status::Ok();
+}
+
+Status QwenModel::Prefill(SequenceState& state,
+                          const std::vector<uint32_t>& tokens,
+                          std::vector<float>& logits) {
+    return Prefill(tokens, static_cast<CpuSequenceState&>(state).cache(),
+                   logits);
+}
+
+Status QwenModel::Decode(SequenceState& state, uint32_t token,
+                         std::vector<float>& logits) {
+    return Decode(token, static_cast<CpuSequenceState&>(state).cache(),
+                  logits);
 }
 
 Status QwenModel::Decode(uint32_t token, QwenKvCache& cache,

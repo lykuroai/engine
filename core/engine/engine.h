@@ -14,7 +14,7 @@
 #include "core/generation/stop.h"
 #include "core/scheduler/scheduler.h"
 #include "core/streaming/event_channel.h"
-#include "model/architectures/qwen/qwen_model.h"
+#include "model/architectures/generative_model.h"
 #include "model/tokenizer/bpe_tokenizer.h"
 #include "model/tokenizer/prompt_template.h"
 #include "observability/metrics.h"
@@ -67,7 +67,7 @@ class InferenceEngine {
 public:
     using Clock = std::function<int64_t()>;  // unix ms
 
-    InferenceEngine(std::unique_ptr<QwenModel> model,
+    InferenceEngine(std::unique_ptr<GenerativeModel> model,
                     std::unique_ptr<BpeTokenizer> tokenizer,
                     EngineConfig config, Clock clock = nullptr);
     ~InferenceEngine();
@@ -84,7 +84,7 @@ public:
     // Returns false when the request id was never seen.
     bool Cancel(const std::string& request_id);
 
-    const QwenConfig& model_config() const { return model_->config(); }
+    const ModelLimits& model_limits() const { return model_->limits(); }
 
     // Model-specific token count for the normalized input (CountTokens RPC).
     Status CountTokens(const std::vector<ChatMessage>& messages,
@@ -105,7 +105,7 @@ private:
     struct ActiveSequence {
         std::unique_ptr<ScheduledRequest> request;
         std::shared_ptr<EventChannel> channel;
-        std::unique_ptr<QwenKvCache> cache;
+        std::unique_ptr<SequenceState> state;
         std::vector<float> logits;
         std::unique_ptr<Sampler> sampler;
         std::unique_ptr<StopMatcher> stop_matcher;
@@ -125,7 +125,7 @@ private:
     void SetState(const std::string& request_id, RequestState state);
     bool IsCancelled(const std::string& request_id) const;
 
-    std::unique_ptr<QwenModel> model_;
+    std::unique_ptr<GenerativeModel> model_;
     std::unique_ptr<BpeTokenizer> tokenizer_;
     EngineConfig config_;
     Clock clock_;

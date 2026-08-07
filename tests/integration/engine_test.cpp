@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "model/architectures/qwen/qwen_model.h"
 #include "tests/testutil/tiny_model.h"
 #include "tests/unit/tokenizer_fixture.h"
 
