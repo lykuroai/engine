@@ -31,6 +31,10 @@ struct FileConfig {
     // [model]
     std::string artifact_path;  // optional; loaded at startup when set
 
+    // [hardware]
+    std::string hardware_backend = "cpu";  // "cpu" | "cuda"
+    int device_id = 0;                     // explicit device (spec §17.3)
+
     // [scheduler]
     uint32_t max_queue = 256;
     uint32_t max_sequences = 8;

@@ -349,6 +349,52 @@ TEST_F(GrpcServerTest, MetricsEndpointReportsRequestCounters) {
     metrics_server.Shutdown();
 }
 
+#ifdef LYKURO_HAVE_CUDA
+// GPU serving e2e: the full gRPC path (LoadModel -> Generate) running on
+// the CUDA backend, and its output must equal the CPU-served output.
+TEST_F(GrpcServerTest, CudaBackendServesIdenticalOutput) {
+    auto serve_once = [&](const std::string& backend) {
+        ServerConfig config;
+        config.credentials = grpc::InsecureServerCredentials();
+        config.load_options.allow_unsigned_dev = true;
+        config.hardware_backend = backend;
+        config.device_id = 0;
+        EngineServer server(config);
+        int port = 0;
+        EXPECT_TRUE(server.Start(&port).ok());
+        EXPECT_TRUE(server.LoadModel(artifact_dir_.string()).ok());
+
+        auto channel =
+            grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                grpc::InsecureChannelCredentials());
+        auto stub = pb::DataService::NewStub(channel);
+        grpc::ClientContext ctx;
+        pb::GenerateRequest req = MakeGenerateRequest("req_" + backend);
+        req.mutable_generation()->set_max_output_tokens(16);
+        pb::GenerateResponse response;
+        EXPECT_TRUE(stub->Generate(&ctx, req, &response).ok());
+        server.Shutdown();
+        return response.output_text();
+    };
+    std::string cpu_text = serve_once("cpu");
+    std::string cuda_text = serve_once("cuda");
+    EXPECT_EQ(cpu_text, cuda_text);
+}
+
+TEST_F(GrpcServerTest, CudaBackendRejectsBadDevice) {
+    ServerConfig config;
+    config.credentials = grpc::InsecureServerCredentials();
+    config.load_options.allow_unsigned_dev = true;
+    config.hardware_backend = "cuda";
+    config.device_id = 99;
+    EngineServer server(config);
+    int port = 0;
+    ASSERT_TRUE(server.Start(&port).ok());
+    EXPECT_FALSE(server.LoadModel(artifact_dir_.string()).ok());
+    server.Shutdown();
+}
+#endif  // LYKURO_HAVE_CUDA
+
 TEST_F(GrpcServerTest, UnloadThenReloadWorks) {
     pb::LoadModelResponse load;
     ASSERT_TRUE(LoadViaControl(&load).ok());

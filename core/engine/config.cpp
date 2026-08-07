@@ -100,8 +100,8 @@ FileConfigResult ParseFileConfig(std::string_view json_text,
     const json::Value& root = *parsed.value;
     FileConfig& c = result.config;
     Status s = CheckKeys(root, "root",
-                         {"engine", "security", "model", "scheduler",
-                          "generation", "observability"});
+                         {"engine", "security", "model", "hardware",
+                          "scheduler", "generation", "observability"});
 
     if (s.ok()) {
         if (const json::Value* v = root.Find("engine")) {
@@ -160,6 +160,21 @@ FileConfigResult ParseFileConfig(std::string_view json_text,
         }
     }
     if (s.ok()) {
+        if (const json::Value* v = root.Find("hardware")) {
+            if (!v->is_object()) {
+                s = Invalid("config section must be an object: hardware");
+            } else {
+                s = CheckKeys(*v, "hardware", {"backend", "device_id"});
+                if (s.ok()) s = GetString(*v, "backend", c.hardware_backend);
+                if (s.ok()) {
+                    uint32_t device = 0;
+                    s = GetUint(*v, "device_id", device, 0, 63);
+                    c.device_id = int(device);
+                }
+            }
+        }
+    }
+    if (s.ok()) {
         if (const json::Value* v = root.Find("scheduler")) {
             if (!v->is_object()) {
                 s = Invalid("config section must be an object: scheduler");
@@ -205,6 +220,10 @@ FileConfigResult ParseFileConfig(std::string_view json_text,
     }
 
     // Cross-field validation (spec §26.3 incompatible combinations).
+    if (s.ok() && c.hardware_backend != "cpu" &&
+        c.hardware_backend != "cuda") {
+        s = Invalid("hardware backend must be cpu or cuda");
+    }
     if (s.ok() && c.log_level != "debug" && c.log_level != "info" &&
         c.log_level != "warn" && c.log_level != "error") {
         s = Invalid("config log_level invalid");

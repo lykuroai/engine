@@ -28,6 +28,11 @@ struct ServerConfig {
     EngineConfig engine;
     ArtifactLoadOptions load_options;
 
+    // Serving backend: "cpu" (reference) or "cuda" (requires a build with
+    // LYKURO_ENABLE_CUDA and an explicit device id, spec §17.3).
+    std::string hardware_backend = "cpu";
+    int device_id = 0;
+
     // Loopback metrics endpoint (GET /metrics). Disabled when false.
     bool metrics_enabled = false;
     uint16_t metrics_port = 0;  // 0 = ephemeral

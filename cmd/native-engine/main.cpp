@@ -54,6 +54,8 @@ int RunServer(const lykuro::nie::FileConfig& config) {
     server_config.engine.scheduler.max_queue = config.max_queue;
     server_config.engine.max_output_tokens_limit = config.max_output_tokens;
     server_config.engine.max_input_bytes = config.max_input_bytes;
+    server_config.hardware_backend = config.hardware_backend;
+    server_config.device_id = config.device_id;
     server_config.metrics_enabled = config.metrics_enabled;
     server_config.metrics_port = config.metrics_port;
     server_config.load_options.allow_unsigned_dev = config.allow_unsigned_dev;

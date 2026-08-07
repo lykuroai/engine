@@ -43,20 +43,26 @@ config は strict JSON(§26 相当、unknown key 拒否)。`mtls_required: true`
 |---|---|
 | 0 Feasibility/Contract | 完了(proto・schema・build・policy) |
 | 1 Correctness PoC | 完了(manifest/loader/tokenizer/CPU reference forward/golden) |
-| 2 Engine MVP | 完了(scheduler/KV/streaming/cancel/deadline/gRPC Data+Control/CountTokens/metrics) |
+| 2 Engine MVP | 完了(scheduler/KV/streaming/cancel/deadline/gRPC Data+Control/CountTokens/metrics/**CUDA backend**) |
 | 3 Hardening | CPU 検証可能分は完了(Ed25519 署名検証、mTLS + service identity 認可、fail-closed config) |
-| 4 Performance | 未着手(GPU 環境必須) |
+| 4 Performance | 未着手(最適化 kernel・batching 強化は今後) |
 | 5 Expansion | 未着手 |
 
-テスト: 164 件(unit / golden / integration / gRPC e2e / mTLS)、
-dev(ASan/UBSan)・release 両構成で全て成功。
+テスト: macOS 164 件(ASan/UBSan・release 両構成)+
+Linux/GPU 156 件、全て成功。CUDA backend は実 GPU
+(RTX 3060 sm_86 / GTX 1650 sm_75、CUDA 12.8、driver 570.211)で
+CPU reference との logits parity(≤1e-3)・greedy 軌跡一致・
+bit-exact 決定性・engine e2e 出力一致を検証済み。
 
 ## 未実装・未検証(spec §35 に基づく明示)
 
-- **CUDA backend**: 開発環境が macOS のため未実装・未検証。
-  `backends/cuda/` は Linux + `LYKURO_ENABLE_CUDA=ON` 用の placeholder。
-  実 GPU での benchmark / certified profile 数値は存在しない。
-  推論は correctness oracle 用の CPU reference(FP32)で動作する。
+- **certified profile の性能数値**: CUDA backend は correctness-first
+  実装(token 逐次 forward、fused kernel なし)であり、実 Qwen
+  checkpoint での benchmark・certified profile 発行は未実施。
+  tiny fixture での throughput は参考値であり契約数値ではない。
+- **gRPC server の GPU 配線**: engine は backend 非依存だが、
+  server の LoadModel は現状 CPU reference を構築する。GPU serving
+  への切替は config `hardware.backend` の配線が必要(小規模)。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。

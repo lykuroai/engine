@@ -33,3 +33,7 @@ target_include_directories(lykuro_api PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(lykuro_api
     PUBLIC lykuro_api_proto lykuro_engine lykuro_model
     PRIVATE lykuro_options)
+if(LYKURO_ENABLE_CUDA)
+    target_compile_definitions(lykuro_api PUBLIC LYKURO_HAVE_CUDA)
+    target_link_libraries(lykuro_api PUBLIC lykuro_backend_cuda)
+endif()

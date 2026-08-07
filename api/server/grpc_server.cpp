@@ -7,6 +7,10 @@
 #include "lykuro/nie/v1/control.grpc.pb.h"
 #include "lykuro/nie/v1/data.grpc.pb.h"
 
+#ifdef LYKURO_HAVE_CUDA
+#include "backends/cuda/qwen_cuda_model.h"
+#endif
+
 namespace lykuro::nie {
 
 namespace pb = ::lykuro::nie::v1;
@@ -609,6 +613,27 @@ Status EngineServer::LoadModel(const std::string& artifact_dir) {
         LoadArtifact(artifact_dir, config_.load_options);
     if (!loaded.status.ok()) return loaded.status;
 
+    // Pick the serving backend. The CPU reference model built during
+    // artifact validation doubles as the smoke-test oracle; for CUDA it
+    // is replaced by the device model before serving.
+    std::unique_ptr<GenerativeModel> serving_model =
+        std::move(loaded.artifact.model);
+    if (config_.hardware_backend == "cuda") {
+#ifdef LYKURO_HAVE_CUDA
+        auto cuda = QwenCudaModel::Load(loaded.artifact.manifest,
+                                        *loaded.artifact.weights,
+                                        config_.device_id);
+        if (!cuda.status.ok()) return cuda.status;
+        serving_model = std::move(cuda.model);
+#else
+        return Status(ErrorCode::kUnsupportedModel,
+                      "this build has no CUDA backend", "control");
+#endif
+    } else if (config_.hardware_backend != "cpu") {
+        return Status(ErrorCode::kInvalidRequest,
+                      "unknown hardware backend", "control");
+    }
+
     manifest_ = std::move(loaded.artifact.manifest);
     weights_ = std::move(loaded.artifact.weights);
     EngineConfig engine_config = config_.engine;
@@ -616,8 +641,8 @@ Status EngineServer::LoadModel(const std::string& artifact_dir) {
         engine_config.metrics = &metrics_;
     }
     engine_ = std::make_unique<InferenceEngine>(
-        std::move(loaded.artifact.model),
-        std::move(loaded.artifact.tokenizer), engine_config);
+        std::move(serving_model), std::move(loaded.artifact.tokenizer),
+        engine_config);
     model_loaded_ = true;
     return Status::Ok();
 }
