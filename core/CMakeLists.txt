@@ -16,5 +16,5 @@ add_library(lykuro_engine STATIC
 )
 target_include_directories(lykuro_engine PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(lykuro_engine
-    PUBLIC lykuro_core lykuro_model
+    PUBLIC lykuro_core lykuro_model lykuro_observability
     PRIVATE lykuro_options)

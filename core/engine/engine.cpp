@@ -35,7 +35,25 @@ InferenceEngine::InferenceEngine(std::unique_ptr<QwenModel> model,
       tokenizer_(std::move(tokenizer)),
       config_(config),
       clock_(clock ? std::move(clock) : SystemNowMs),
-      scheduler_(config.scheduler) {}
+      scheduler_(config.scheduler) {
+    if (config_.metrics != nullptr) {
+        MetricsRegistry& m = *config_.metrics;
+        m_received_ = m.GetCounter("nie_requests_received_total",
+                                   "Requests received by the engine");
+        m_rejected_ = m.GetCounter("nie_requests_rejected_total",
+                                   "Requests rejected at admission");
+        m_admitted_ = m.GetCounter("nie_requests_admitted_total",
+                                   "Requests admitted to a decode slot");
+        m_completed_ = m.GetCounter("nie_requests_completed_total",
+                                    "Requests finished successfully");
+        m_failed_ = m.GetCounter("nie_requests_failed_total",
+                                 "Requests finished with an error");
+        m_cancelled_ = m.GetCounter("nie_requests_cancelled_total",
+                                    "Requests cancelled");
+        m_output_tokens_ = m.GetCounter("nie_output_tokens_total",
+                                        "Output tokens generated");
+    }
+}
 
 InferenceEngine::~InferenceEngine() {
     // Safe-shutdown ordering (spec §29.2): cancel queued and active work,
@@ -58,6 +76,25 @@ bool InferenceEngine::IsCancelled(const std::string& request_id) const {
 }
 
 InferenceEngine::SubmitResult InferenceEngine::Submit(
+    const InferenceRequest& request) {
+    if (m_received_ != nullptr) m_received_->Increment();
+    SubmitResult result = SubmitImpl(request);
+    if (!result.status.ok() && m_rejected_ != nullptr) {
+        m_rejected_->Increment();
+    }
+    return result;
+}
+
+Status InferenceEngine::CountTokens(
+    const std::vector<ChatMessage>& messages, uint32_t& tokens_out) const {
+    std::vector<uint32_t> tokens;
+    Status s = QwenChatTemplate::BuildPrompt(*tokenizer_, messages, tokens);
+    if (!s.ok()) return s;
+    tokens_out = uint32_t(tokens.size());
+    return Status::Ok();
+}
+
+InferenceEngine::SubmitResult InferenceEngine::SubmitImpl(
     const InferenceRequest& request) {
     SubmitResult result;
     const int64_t now = clock_();
@@ -240,6 +277,14 @@ void InferenceEngine::FinishSequence(size_t index, FinishReason reason) {
                                     : RequestState::kCompleted;
         channels_.erase(request_id);
     }
+    if (reason == FinishReason::kCancelled) {
+        if (m_cancelled_ != nullptr) m_cancelled_->Increment();
+    } else if (m_completed_ != nullptr) {
+        m_completed_->Increment();
+    }
+    if (m_output_tokens_ != nullptr) {
+        m_output_tokens_->Increment(usage.output_tokens);
+    }
     // Releases KV cache and all per-sequence state (spec §16.1).
     active_.erase(active_.begin() + long(index));
 }
@@ -262,6 +307,7 @@ void InferenceEngine::FailSequence(size_t index, Status status) {
         registry_[request_id] = RequestState::kFailed;
         channels_.erase(request_id);
     }
+    if (m_failed_ != nullptr) m_failed_->Increment();
     active_.erase(active_.begin() + long(index));
 }
 
@@ -287,6 +333,7 @@ void InferenceEngine::RejectExpired(int64_t now) {
             channel->TryPush(std::move(e));
             channel->Close();
         }
+        if (m_failed_ != nullptr) m_failed_->Increment();
     }
 }
 
@@ -335,6 +382,7 @@ void InferenceEngine::AdmitPending(int64_t now) {
         seq.started_unix_ms = now;
 
         SetState(request_id, RequestState::kActive);
+        if (m_admitted_ != nullptr) m_admitted_->Increment();
 
         StreamEvent started;
         started.kind = StreamEvent::Kind::kStarted;

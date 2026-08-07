@@ -1,7 +1,11 @@
 #include "api/server/grpc_server.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <grpcpp/grpcpp.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -278,6 +282,71 @@ TEST_F(GrpcServerTest, DrainRejectsThenResumeAccepts) {
                                    &response)
                         .ok());
     }
+}
+
+TEST_F(GrpcServerTest, CountTokensMatchesGenerateUsage) {
+    pb::LoadModelResponse load;
+    ASSERT_TRUE(LoadViaControl(&load).ok());
+
+    pb::GenerateRequest gen = MakeGenerateRequest("req_count");
+    grpc::ClientContext gen_ctx;
+    pb::GenerateResponse gen_response;
+    ASSERT_TRUE(data_stub_->Generate(&gen_ctx, gen, &gen_response).ok());
+
+    grpc::ClientContext ctx;
+    pb::CountTokensRequest req;
+    *req.mutable_input() = gen.input();
+    pb::CountTokensResponse response;
+    ASSERT_TRUE(data_stub_->CountTokens(&ctx, req, &response).ok());
+    EXPECT_EQ(response.input_tokens(), gen_response.usage().input_tokens());
+    EXPECT_GT(response.input_tokens(), 0u);
+}
+
+TEST_F(GrpcServerTest, MetricsEndpointReportsRequestCounters) {
+    ServerConfig config;
+    config.credentials = grpc::InsecureServerCredentials();
+    config.load_options.allow_unsigned_dev = true;
+    config.metrics_enabled = true;
+    EngineServer metrics_server(config);
+    int port = 0;
+    uint16_t metrics_port = 0;
+    ASSERT_TRUE(metrics_server.Start(&port, &metrics_port).ok());
+    ASSERT_GT(metrics_port, 0);
+    ASSERT_TRUE(metrics_server.LoadModel(artifact_dir_.string()).ok());
+
+    auto channel =
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                            grpc::InsecureChannelCredentials());
+    auto stub = pb::DataService::NewStub(channel);
+    grpc::ClientContext ctx;
+    pb::GenerateResponse response;
+    ASSERT_TRUE(
+        stub->Generate(&ctx, MakeGenerateRequest("req_m"), &response).ok());
+
+    // Raw HTTP GET against the loopback metrics port.
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(metrics_port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(
+        ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const char kReq[] = "GET /metrics HTTP/1.1\r\nHost: l\r\n\r\n";
+    ::send(fd, kReq, sizeof(kReq) - 1, 0);
+    std::string body;
+    char buf[8192];
+    ssize_t n;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) body.append(buf, n);
+    ::close(fd);
+
+    EXPECT_NE(body.find("nie_requests_received_total 1"), std::string::npos)
+        << body;
+    EXPECT_NE(body.find("nie_requests_completed_total 1"),
+              std::string::npos);
+    EXPECT_NE(body.find("nie_output_tokens_total 5"), std::string::npos);
+    // Content-free check: no prompt text in the exposition.
+    EXPECT_EQ(body.find("hello"), std::string::npos);
+    metrics_server.Shutdown();
 }
 
 TEST_F(GrpcServerTest, UnloadThenReloadWorks) {

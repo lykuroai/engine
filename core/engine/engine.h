@@ -17,6 +17,7 @@
 #include "model/architectures/qwen/qwen_model.h"
 #include "model/tokenizer/bpe_tokenizer.h"
 #include "model/tokenizer/prompt_template.h"
+#include "observability/metrics.h"
 
 namespace lykuro::nie {
 
@@ -28,6 +29,9 @@ struct EngineConfig {
     SchedulerConfig scheduler;
     SamplingLimits sampling_limits;
     StopLimits stop_limits;
+    // Optional; must outlive the engine when set. Only identifier-free
+    // counters are recorded (spec §24.2).
+    MetricsRegistry* metrics = nullptr;
 };
 
 // Normalized inference request (Data API Generate/GenerateStream payload
@@ -82,6 +86,10 @@ public:
 
     const QwenConfig& model_config() const { return model_->config(); }
 
+    // Model-specific token count for the normalized input (CountTokens RPC).
+    Status CountTokens(const std::vector<ChatMessage>& messages,
+                       uint32_t& tokens_out) const;
+
     // Runs one scheduler+decode iteration. Returns true while work remains.
     bool Step();
     void RunUntilIdle();
@@ -107,6 +115,7 @@ private:
         int64_t started_unix_ms = 0;
     };
 
+    SubmitResult SubmitImpl(const InferenceRequest& request);
     void Emit(ActiveSequence& seq, StreamEvent event);
     void FinishSequence(size_t index, FinishReason reason);
     void FailSequence(size_t index, Status status);
@@ -131,6 +140,15 @@ private:
 
     // Touched only by the Step() thread.
     std::vector<ActiveSequence> active_;
+
+    // Metrics (null when disabled).
+    MetricsRegistry::Counter* m_received_ = nullptr;
+    MetricsRegistry::Counter* m_rejected_ = nullptr;
+    MetricsRegistry::Counter* m_admitted_ = nullptr;
+    MetricsRegistry::Counter* m_completed_ = nullptr;
+    MetricsRegistry::Counter* m_failed_ = nullptr;
+    MetricsRegistry::Counter* m_cancelled_ = nullptr;
+    MetricsRegistry::Counter* m_output_tokens_ = nullptr;
 };
 
 }  // namespace lykuro::nie

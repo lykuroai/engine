@@ -17,6 +17,7 @@ add_executable(unit_tests
     unit/artifact_loader_test.cpp
     unit/scheduler_test.cpp
     unit/event_channel_test.cpp
+    unit/metrics_test.cpp
     testutil/tiny_model.cpp
     integration/engine_test.cpp
 )

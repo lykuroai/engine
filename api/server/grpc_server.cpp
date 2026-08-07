@@ -319,11 +319,31 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status CountTokens(grpc::ServerContext*,
-                             const pb::CountTokensRequest*,
-                             pb::CountTokensResponse*) override {
-        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
-                            "count_tokens lands with the tokenizer service");
+    grpc::Status CountTokens(grpc::ServerContext* context,
+                             const pb::CountTokensRequest* request,
+                             pb::CountTokensResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.data_identities);
+        if (!auth.ok()) return auth;
+        InferenceEngine* engine = server_->engine();
+        if (engine == nullptr) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "model_not_loaded");
+        }
+        pb::GenerateRequest wrapper;
+        wrapper.set_request_id("count_tokens");
+        *wrapper.mutable_input() = request->input();
+        wrapper.mutable_generation()->set_max_output_tokens(1);
+        InferenceRequest req;
+        Status s = FromProtoRequest(wrapper, req);
+        uint32_t tokens = 0;
+        if (s.ok()) s = engine->CountTokens(req.messages, tokens);
+        if (!s.ok()) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                std::string(ErrorCodeName(s.code())));
+        }
+        response->set_input_tokens(tokens);
+        return grpc::Status::OK;
     }
 
     grpc::Status GetCapabilities(grpc::ServerContext* context,
@@ -505,7 +525,28 @@ EngineServer::EngineServer(ServerConfig config)
 
 EngineServer::~EngineServer() { Shutdown(); }
 
-Status EngineServer::Start(int* port_out) {
+Status EngineServer::Start(int* port_out, uint16_t* metrics_port_out) {
+    if (config_.metrics_enabled) {
+        metrics_.RegisterGauge("nie_queue_depth",
+                               "Requests waiting for admission", [this] {
+                                   InferenceEngine* e = engine();
+                                   return e ? int64_t(e->queue_depth()) : 0;
+                               });
+        metrics_.RegisterGauge("nie_active_sequences",
+                               "Sequences currently decoding", [this] {
+                                   InferenceEngine* e = engine();
+                                   return e ? int64_t(e->active_sequences())
+                                            : 0;
+                               });
+        metrics_http_ = std::make_unique<MetricsHttpServer>(metrics_);
+        uint16_t bound = 0;
+        if (!metrics_http_->Start(config_.metrics_port, &bound)) {
+            return Status(ErrorCode::kInternalError,
+                          "metrics endpoint failed to bind", "api");
+        }
+        if (metrics_port_out != nullptr) *metrics_port_out = bound;
+    }
+
     if (!config_.credentials) {
         return Status(ErrorCode::kInternalError,
                       "server credentials are required", "api");
@@ -542,6 +583,10 @@ void EngineServer::WorkerLoop() {
 }
 
 void EngineServer::Shutdown() {
+    if (metrics_http_) {
+        metrics_http_->Stop();
+        metrics_http_.reset();
+    }
     if (server_) {
         server_->Shutdown();
     }
@@ -566,9 +611,13 @@ Status EngineServer::LoadModel(const std::string& artifact_dir) {
 
     manifest_ = std::move(loaded.artifact.manifest);
     weights_ = std::move(loaded.artifact.weights);
+    EngineConfig engine_config = config_.engine;
+    if (config_.metrics_enabled) {
+        engine_config.metrics = &metrics_;
+    }
     engine_ = std::make_unique<InferenceEngine>(
         std::move(loaded.artifact.model),
-        std::move(loaded.artifact.tokenizer), config_.engine);
+        std::move(loaded.artifact.tokenizer), engine_config);
     model_loaded_ = true;
     return Status::Ok();
 }

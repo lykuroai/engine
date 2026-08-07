@@ -27,6 +27,10 @@ struct ServerConfig {
 
     EngineConfig engine;
     ArtifactLoadOptions load_options;
+
+    // Loopback metrics endpoint (GET /metrics). Disabled when false.
+    bool metrics_enabled = false;
+    uint16_t metrics_port = 0;  // 0 = ephemeral
 };
 
 // Builds mTLS server credentials: server cert/key plus the client CA,
@@ -45,8 +49,10 @@ public:
     explicit EngineServer(ServerConfig config);
     ~EngineServer();
 
-    // Starts the gRPC server. Returns the bound port via `port_out`.
-    Status Start(int* port_out = nullptr);
+    // Starts the gRPC server. Returns the bound port via `port_out`, and
+    // the metrics port via `metrics_port_out` when metrics are enabled.
+    Status Start(int* port_out = nullptr,
+                 uint16_t* metrics_port_out = nullptr);
     void Shutdown();
 
     // Direct (in-process) access used by the Control service and tests.
@@ -72,6 +78,9 @@ private:
     bool model_loaded_ = false;
     // Weight mapping + tokenizer storage kept alive alongside the engine.
     std::unique_ptr<SafetensorsFile> weights_;
+
+    MetricsRegistry metrics_;
+    std::unique_ptr<MetricsHttpServer> metrics_http_;
 
     std::atomic<bool> running_{false};
     std::thread worker_;
