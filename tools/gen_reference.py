@@ -35,9 +35,13 @@ def main() -> int:
         ids = tokenizer(prompt, return_tensors="pt").input_ids
         with torch.no_grad():
             logits = model(ids).logits[0, -1]
+            # Pure greedy: neutralize checkpoint generation_config extras
+            # (Qwen2.5 ships repetition_penalty=1.1, which the engine's
+            # sampler_v1 deliberately does not implement in MVP).
             generated = model.generate(
                 ids, max_new_tokens=32, do_sample=False,
-                eos_token_id=None, pad_token_id=0)
+                repetition_penalty=1.0, temperature=None, top_p=None,
+                top_k=None, eos_token_id=None, pad_token_id=0)
         cases.append({
             "prompt": prompt,
             "prompt_ids": ids[0].tolist(),

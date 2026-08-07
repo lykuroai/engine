@@ -60,12 +60,27 @@ CUDA backend の検証内容:
 - production 形態(signed artifact + mTLS + CUDA + metrics)での
   `native-engine` バイナリ起動・モデルロード・graceful shutdown
 
+## 外部 oracle 照合(実 Qwen checkpoint、2026-08-08 実施)
+
+Qwen2.5-0.5B-Instruct(BF16、988MB)を `tools/convert_hf_qwen.py` で
+artifact 化し、HF transformers FP32 を oracle として照合
+(`tools/verify_reference`、英語・数式・日本語の 3 プロンプト):
+
+| Backend | prefill logits 最大誤差 | argmax | greedy 32 token |
+|---|---|---|---|
+| CUDA(RTX 3060) | ≤2e-5 | 3/3 一致 | **3/3 完全一致** |
+| CPU reference | ≤9e-5 | 3/3 一致 | **3/3 完全一致** |
+
+注: oracle は純粋 greedy(HF checkpoint 同梱の repetition_penalty=1.1
+は無効化。本 Engine は仕様 §18.1 どおり MVP では repetition penalty
+非対応)。
+
 ## 未実装・未検証(spec §35 に基づく明示)
 
 - **certified profile の性能数値**: CUDA backend は correctness-first
-  実装(token 逐次 forward、fused kernel なし)であり、実 Qwen
-  checkpoint での benchmark・certified profile 発行は未実施。
-  tiny fixture での throughput は参考値であり契約数値ではない。
+  実装(token 逐次 forward、fused kernel なし)で、0.5B 実モデルの
+  decode はおおむね 18 tok/s 程度(RTX 3060、参考値)。performance
+  最適化と certified profile 発行は Phase 4。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。
