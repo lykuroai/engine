@@ -9,6 +9,10 @@ add_executable(unit_tests
     unit/tokenizer_test.cpp
     unit/prompt_template_test.cpp
     unit/dtype_test.cpp
+    unit/sampler_test.cpp
+    unit/stop_test.cpp
+    unit/qwen_model_test.cpp
+    golden/golden_test.cpp
 )
 target_link_libraries(unit_tests
     PRIVATE lykuro_core lykuro_model lykuro_security lykuro_backend_cpu
