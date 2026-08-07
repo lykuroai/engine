@@ -3,6 +3,7 @@ find_package(CUDAToolkit REQUIRED)
 add_library(lykuro_backend_cuda STATIC
     cuda_backend.cu
     qwen_cuda_model.cu
+    qwen_tp_model.cu
 )
 # Certified targets: sm_75 (Turing) and sm_86 (Ampere).
 set_target_properties(lykuro_backend_cuda PROPERTIES

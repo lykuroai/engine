@@ -10,6 +10,7 @@
 
 #include "backends/cuda/cuda_backend.h"
 #include "backends/cuda/qwen_cuda_model.h"
+#include "backends/cuda/qwen_tp_model.h"
 #include "core/engine/engine.h"
 #include "core/generation/sampler.h"
 #include "model/architectures/qwen/qwen_model.h"
@@ -449,6 +450,88 @@ TEST_F(CudaParityTest, QuantizedModelsRunAndStayClose) {
             qmodel.model->Prefill(*rerun_state, prompt, rerun_logits).ok());
         EXPECT_EQ(q_logits, rerun_logits);
     }
+}
+
+// ---- tensor parallel (Phase 5 PoC) ----
+
+TEST_F(CudaParityTest, TensorParallelMatchesCpuReference) {
+    // Prefer two physical devices; fall back to two shards on one GPU
+    // (streams + separate buffers keep the math identical).
+    std::vector<CudaDeviceInfo> devices;
+    ASSERT_TRUE(DiscoverCudaDevices(devices).ok());
+    QwenTpModel::Options options;
+    options.device_ids = devices.size() >= 2
+                             ? std::vector<int>{0, 1}
+                             : std::vector<int>{TestDevice(), TestDevice()};
+
+    auto tp = QwenTpModel::Load(manifest_, file_, options);
+    ASSERT_TRUE(tp.status.ok()) << tp.status.message();
+
+    const std::vector<uint32_t> prompt = {1, 5, 9, 2, 17, 250};
+    std::unique_ptr<SequenceState> cpu_state, tp_state;
+    ASSERT_TRUE(cpu_->CreateSequence(64, cpu_state).ok());
+    ASSERT_TRUE(tp.model->CreateSequence(64, tp_state).ok());
+
+    std::vector<float> cpu_logits, tp_logits;
+    ASSERT_TRUE(cpu_->Prefill(*cpu_state, prompt, cpu_logits).ok());
+    ASSERT_TRUE(tp.model->Prefill(*tp_state, prompt, tp_logits).ok());
+    ExpectClose(cpu_logits, tp_logits, 1e-3f, "tp prefill logits");
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    Sampler s1(greedy), s2(greedy);
+    for (int step = 0; step < 20; ++step) {
+        uint32_t t1 = 0, t2 = 0;
+        ASSERT_TRUE(s1.Sample(cpu_logits, t1).ok());
+        ASSERT_TRUE(s2.Sample(tp_logits, t2).ok());
+        ASSERT_EQ(t1, t2) << "tp greedy divergence at step " << step;
+        ASSERT_TRUE(cpu_->Decode(*cpu_state, t1, cpu_logits).ok());
+        ASSERT_TRUE(tp.model->Decode(*tp_state, t2, tp_logits).ok());
+        ExpectClose(cpu_logits, tp_logits, 1e-3f, "tp decode logits");
+    }
+}
+
+TEST_F(CudaParityTest, TensorParallelIsDeterministic) {
+    QwenTpModel::Options options;
+    options.device_ids = {TestDevice(), TestDevice()};
+    auto tp = QwenTpModel::Load(manifest_, file_, options);
+    ASSERT_TRUE(tp.status.ok());
+
+    auto run = [&](std::vector<float>& out) {
+        std::unique_ptr<SequenceState> state;
+        ASSERT_TRUE(tp.model->CreateSequence(64, state).ok());
+        std::vector<float> logits;
+        ASSERT_TRUE(tp.model->Prefill(*state, {1, 2, 3}, logits).ok());
+        for (int i = 0; i < 6; ++i) {
+            ASSERT_TRUE(
+                tp.model->Decode(*state, uint32_t(i * 7 % 300), logits)
+                    .ok());
+        }
+        out = logits;
+    };
+    std::vector<float> a, b;
+    run(a);
+    run(b);
+    EXPECT_EQ(a, b);
+}
+
+TEST_F(CudaParityTest, TensorParallelRejectsUnevenShapes) {
+    testutil::TinyModelSpec spec;
+    spec.vocab_size = 303;
+    spec.eos_token_id = 302;
+    spec.num_kv_heads = 1;  // not divisible across two shards
+    ModelManifest manifest = testutil::MakeTinyManifest(spec);
+    std::string path =
+        testutil::WriteTinyWeights(spec, "tp_uneven.safetensors");
+    SafetensorsFile file;
+    ASSERT_TRUE(file.Open(path).ok());
+
+    QwenTpModel::Options options;
+    options.device_ids = {TestDevice(), TestDevice()};
+    auto tp = QwenTpModel::Load(manifest, file, options);
+    EXPECT_FALSE(tp.status.ok());
+    EXPECT_EQ(tp.status.code(), ErrorCode::kUnsupportedModel);
+    std::remove(path.c_str());
 }
 
 // Not a certified benchmark (tiny random model): records rough

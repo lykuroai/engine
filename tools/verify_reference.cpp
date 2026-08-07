@@ -20,6 +20,7 @@
 #include "model/loader/artifact_loader.h"
 #ifdef LYKURO_HAVE_CUDA
 #include "backends/cuda/qwen_cuda_model.h"
+#include "backends/cuda/qwen_tp_model.h"
 #endif
 
 using namespace lykuro::nie;
@@ -78,7 +79,23 @@ int main(int argc, char** argv) {
     }
 
     std::unique_ptr<GenerativeModel> model = std::move(loaded.artifact.model);
-    if (backend.rfind("cuda", 0) == 0) {
+    if (backend.rfind("cuda-tp", 0) == 0) {
+#ifdef LYKURO_HAVE_CUDA
+        QwenTpModel::Options tp_options;
+        tp_options.device_ids = {0, 1};
+        auto tp = QwenTpModel::Load(loaded.artifact.manifest,
+                                    *loaded.artifact.weights, tp_options);
+        if (!tp.status.ok()) {
+            std::fprintf(stderr, "tp load failed: %s\n",
+                         tp.status.message().c_str());
+            return 1;
+        }
+        model = std::move(tp.model);
+#else
+        std::fprintf(stderr, "no CUDA in this build\n");
+        return 1;
+#endif
+    } else if (backend.rfind("cuda", 0) == 0) {
 #ifdef LYKURO_HAVE_CUDA
         CudaModelOptions cuda_options;
         if (!ParseCudaBackend(backend, cuda_options)) {

@@ -45,8 +45,8 @@ config は strict JSON(§26 相当、unknown key 拒否)。`mtls_required: true`
 | 1 Correctness PoC | 完了(manifest/loader/tokenizer/CPU reference forward/golden) |
 | 2 Engine MVP | 完了(scheduler/KV/streaming/cancel/deadline/gRPC Data+Control/CountTokens/metrics/**CUDA backend**) |
 | 3 Hardening | CPU 検証可能分は完了(Ed25519 署名検証、mTLS + service identity 認可、fail-closed config) |
-| 4 Performance | 未着手(最適化 kernel・batching 強化は今後) |
-| 5 Expansion | 未着手 |
+| 4 Performance | 主要項目完了(bf16常駐/fusion/graphs/paged KV/prefix cache/量子化) |
+| 5 Expansion | **2-GPU tensor parallel(correctness PoC)実装・実機検証済み** |
 
 テスト: macOS 164 件(ASan/UBSan・release 両構成)+
 Linux/GPU **173 件**(CUDA + gRPC + OpenSSL フル構成)、全て成功。
@@ -154,9 +154,19 @@ artifact 化し、HF transformers FP32 を oracle として照合
 
   int8 も 171 tok/s と bf16 超え(チェーン短縮で帯域削減が発現)。
 
-  Phase 4 主要項目は以上で完了。今後: offline 量子化(artifact
-  pipeline + 品質評価)、§25.3 完全 benchmark、bucket16 GEMM 経路の
-  fusion 適用。
+  **2-GPU tensor parallel(Phase 5、correctness PoC)実装済み**:
+  Megatron 方式(Q/K/V head 分割・KV cache は各 GPU が自 head 分のみ
+  所有、o_proj/down_proj 列分割 + host 固定順 all-reduce、gate/up 行
+  分割)。embed/lm_head は device 0 常駐。分割不能な形状は
+  unsupported_model で拒否。**実機の異種ペア(RTX 3060 + GTX 1650)で
+  実 Qwen 0.5B の oracle 3/3 完全一致(logits ≤2e-5、greedy 96/96)、
+  bit-exact 決定性を確認**。PCIe + host reduce のため速度は単一 GPU 比
+  で遅く(このモデルでは意図どおり)、目的は TP アーキテクチャの
+  正しさ検証と単一 GPU VRAM 超モデルへの布石。NCCL 化・per-shard
+  GEMM 最適化は今後。
+
+  残項目: 24h soak、offline 量子化 pipeline、bucket16 GEMM fusion、
+  NCCL ベース TP、CPU/AMD serving。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。
