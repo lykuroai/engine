@@ -42,6 +42,10 @@ public:
                    std::vector<float>& logits) override;
     Status Decode(SequenceState& state, uint32_t token,
                   std::vector<float>& logits) override;
+    // Batched decode: one GPU pass for up to 16 sequences per group,
+    // amortizing weight reads across sequences.
+    Status DecodeBatch(std::vector<DecodeBatchItem>& items,
+                       std::vector<Status>& per_item) override;
 
     const QwenConfig& config() const { return config_; }
 

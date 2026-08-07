@@ -91,12 +91,21 @@ artifact 化し、HF transformers FP32 を oracle として照合
   | 1289 | 2.2 s(prefill 584 tok/s) | 136 |
   | 2569 | 5.9 s | 125 |
 
+  multi-sequence batched decode(aggregate、RTX 3060):
+
+  | batch | aggregate tok/s |
+  |---:|---:|
+  | 1 | 152 |
+  | 4 | 251 |
+  | 8 | 285 |
+  | 16 | 450 |
+
   GTX 1650(sm_75): 短 prompt で decode 67 tok/s。
   最適化前(fp32 weight + cuBLAS SGEMV、逐次 prefill、単純 attention)
   は decode 約 18 tok/s、TTFT 85 ms(18 tok)、ctx 1289 で 58 tok/s。
-  数値は §25.3 の完全な benchmark(concurrent / soak / saturation)を
-  経ていないため certified profile としては未発行。multi-sequence
-  batched decode・paged KV・量子化は今後の Phase 4 継続項目。
+  数値は §25.3 の完全な benchmark(soak / saturation)を経ていないため
+  certified profile としては未発行。paged KV・prefix cache・量子化は
+  今後の Phase 4 継続項目。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。

@@ -256,6 +256,232 @@ __global__ void CombineAttentionKernel(const float* __restrict__ partials,
     }
 }
 
+// ---- batched decode kernels (Phase 4 multi-sequence path) ----
+
+constexpr int kMaxBatch = 16;  // sequences decoded per GPU pass
+
+// RoPE with a distinct position per row (one row per sequence).
+__global__ void RopeVarPosKernel(float* __restrict__ buf, int row_stride,
+                                 int head_dim,
+                                 const uint32_t* __restrict__ positions,
+                                 float theta) {
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int half = head_dim / 2;
+    float* h = buf + size_t(row) * row_stride + head * head_dim;
+    const uint32_t pos = positions[row];
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = powf(theta, -2.0f * float(i) / float(head_dim));
+        float angle = float(pos) * freq;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        float a = h[i];
+        float b = h[i + half];
+        h[i] = a * c - b * s;
+        h[i + half] = b * c + a * s;
+    }
+}
+
+// Scatters row i of `src` into sequence i's cache at its position.
+// `bases[i]` is the layer's K (or V) base pointer for sequence i.
+__global__ void ScatterKvKernel(const float* __restrict__ src,
+                                float* const* __restrict__ bases,
+                                const uint32_t* __restrict__ positions,
+                                int kv_dim) {
+    const int row = blockIdx.x;
+    float* dst = bases[row] + size_t(positions[row]) * kv_dim;
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+        dst[i] = src[size_t(row) * kv_dim + i];
+    }
+}
+
+// Split-K attention across a batch of sequences: grid (head, split, seq).
+// Per-sequence context and cache bases; partials indexed [seq][head][split].
+__global__ void BatchSplitAttentionKernel(
+    const float* __restrict__ q_rows, float* const* __restrict__ k_bases,
+    float* const* __restrict__ v_bases,
+    const uint32_t* __restrict__ positions, float* __restrict__ partials,
+    int head_dim, int kv_stride, int group, float scale, int splits) {
+    __shared__ float scores[kMaxSegment];
+    __shared__ float red[kAttnThreads];
+    const int head = blockIdx.x;
+    const int split = blockIdx.y;
+    const int seq = blockIdx.z;
+    const int kv_head = head / group;
+    const int context = int(positions[seq]) + 1;
+    const int q_dim = gridDim.x * head_dim;
+    const float* qh = q_rows + size_t(seq) * q_dim + head * head_dim;
+    const float* k_cache = k_bases[seq];
+    const float* v_cache = v_bases[seq];
+    float* part = partials +
+                  ((size_t(seq) * gridDim.x + head) * kMaxSplits + split) *
+                      (head_dim + 2);
+
+    const int seg = (context + splits - 1) / splits;
+    const int t0 = split * seg;
+    const int t1 = min(context, t0 + seg);
+    const int len = t1 - t0;
+    if (len <= 0) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            part[d] = 0.0f;
+        }
+        if (threadIdx.x == 0) {
+            part[head_dim] = -1e30f;
+            part[head_dim + 1] = 0.0f;
+        }
+        return;
+    }
+
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        const float* kt =
+            k_cache + size_t(t0 + j) * kv_stride + kv_head * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += qh[d] * kt[d];
+        }
+        scores[j] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        local_max = fmaxf(local_max, scores[j]);
+    }
+    red[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] =
+                fmaxf(red[threadIdx.x], red[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float m = red[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        scores[j] = expf(scores[j] - m);
+        local_sum += scores[j];
+    }
+    red[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = red[0];
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < len; ++j) {
+            const float* vt =
+                v_cache + size_t(t0 + j) * kv_stride + kv_head * head_dim;
+            acc += scores[j] * vt[d];
+        }
+        part[d] = acc;
+    }
+    if (threadIdx.x == 0) {
+        part[head_dim] = m;
+        part[head_dim + 1] = denom;
+    }
+}
+
+// Combine per (head, seq): grid (head, seq).
+__global__ void BatchCombineAttentionKernel(
+    const float* __restrict__ partials, float* __restrict__ out,
+    int head_dim, int splits) {
+    const int head = blockIdx.x;
+    const int seq = blockIdx.y;
+    const int q_dim = gridDim.x * head_dim;
+    const float* base = partials +
+                        (size_t(seq) * gridDim.x + head) * kMaxSplits *
+                            (head_dim + 2);
+    __shared__ float m_glob, denom_glob;
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int s = 0; s < splits; ++s) {
+            m = fmaxf(m, base[size_t(s) * (head_dim + 2) + head_dim]);
+        }
+        float denom = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const float* p = base + size_t(s) * (head_dim + 2);
+            denom += p[head_dim + 1] * expf(p[head_dim] - m);
+        }
+        m_glob = m;
+        denom_glob = denom;
+    }
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const float* p = base + size_t(s) * (head_dim + 2);
+            acc += p[d] * expf(p[head_dim] - m_glob);
+        }
+        out[size_t(seq) * q_dim + head * head_dim + d] = acc / denom_glob;
+    }
+}
+
+// Batched GEMV for the decode regime (B <= kMaxBatch): one block per
+// output row stages the weight row through shared memory once and reuses
+// it for every sequence, so the weight-read bandwidth is amortized across
+// the batch. Fixed-order reductions keep it deterministic.
+constexpr int kBgemvChunk = 1024;
+
+// B is a compile-time constant so per-sequence accumulators stay in
+// registers (a dynamically-indexed array would spill to local memory).
+// Rows beyond the real batch are padding whose outputs are ignored.
+template <typename WT, int B>
+__global__ void MatVecBatchKernel(const WT* __restrict__ w,
+                                  const float* __restrict__ x,  // [B, in]
+                                  const float* __restrict__ bias,
+                                  int in_dim, float* __restrict__ y,
+                                  int ldy) {
+    __shared__ float wsh[kBgemvChunk];
+    __shared__ float red[128];
+    const size_t row = blockIdx.x;
+    const WT* wr = w + row * size_t(in_dim);
+
+    float acc[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.0f;
+
+    for (int k0 = 0; k0 < in_dim; k0 += kBgemvChunk) {
+        const int len = min(kBgemvChunk, in_dim - k0);
+        for (int i = threadIdx.x; i < len; i += blockDim.x) {
+            wsh[i] = LoadWeight(wr, k0 + i);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < len; i += blockDim.x) {
+            const float wv = wsh[i];
+#pragma unroll
+            for (int b = 0; b < B; ++b) {
+                acc[b] += wv * x[size_t(b) * in_dim + k0 + i];
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        red[threadIdx.x] = acc[b];
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] += red[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            y[size_t(b) * ldy + row] =
+                red[0] + (bias != nullptr ? bias[row] : 0.0f);
+        }
+        __syncthreads();
+    }
+}
+
 // ---- batched prefill kernels (Phase 4 GEMM path) ----
 
 constexpr int kChunk = 128;      // prompt tokens per chunk
@@ -526,6 +752,38 @@ void LaunchMatVec(const WeightBuffer& w, const float* x, const float* bias,
     }
 }
 
+template <typename WT>
+void LaunchMatVecBatchTyped(const WT* w, const float* x, const float* bias,
+                            int batch, int in_dim, int out_dim, float* y,
+                            int ldy) {
+    if (batch <= 2) {
+        MatVecBatchKernel<WT, 2><<<out_dim, 128>>>(w, x, bias, in_dim, y,
+                                                   ldy);
+    } else if (batch <= 4) {
+        MatVecBatchKernel<WT, 4><<<out_dim, 128>>>(w, x, bias, in_dim, y,
+                                                   ldy);
+    } else if (batch <= 8) {
+        MatVecBatchKernel<WT, 8><<<out_dim, 128>>>(w, x, bias, in_dim, y,
+                                                   ldy);
+    } else {
+        MatVecBatchKernel<WT, 16><<<out_dim, 128>>>(w, x, bias, in_dim, y,
+                                                    ldy);
+    }
+}
+
+void LaunchMatVecBatch(const float* x, const WeightBuffer& w,
+                       const float* bias, int batch, int in_dim,
+                       int out_dim, float* y, int ldy) {
+    if (w.bf16) {
+        LaunchMatVecBatchTyped(
+            static_cast<const __nv_bfloat16*>(w.buf.ptr), x, bias, batch,
+            in_dim, out_dim, y, ldy);
+    } else {
+        LaunchMatVecBatchTyped(static_cast<const float*>(w.buf.ptr), x,
+                               bias, batch, in_dim, out_dim, y, ldy);
+    }
+}
+
 void LaunchGemm(const float* x, const WeightBuffer& w, const float* bias,
                 int n, int in_dim, int out_dim, float* c, int ldc) {
     dim3 grid((out_dim + kGemmTile - 1) / kGemmTile,
@@ -564,6 +822,13 @@ struct QwenCudaModel::Impl {
         up_rows;
     DeviceBuffer d_tokens;  // kChunk uint32
     bool chunked_prefill = false;  // head_dim power-of-two <= 128
+
+    // Batched-decode staging (kMaxBatch sequences per pass).
+    DeviceBuffer d_positions;      // kMaxBatch uint32
+    DeviceBuffer d_kv_ptrs;        // [layers, 2, kMaxBatch] float*
+    DeviceBuffer kv_k_rows, kv_v_rows;  // [kMaxBatch, kv_dim]
+    DeviceBuffer batch_logits;     // [kMaxBatch, vocab]
+    DeviceBuffer batch_partials;   // [kMaxBatch, heads, kMaxSplits, hd+2]
 };
 
 namespace {
@@ -705,6 +970,30 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(const ModelManifest& manifest,
             s = impl.up_rows.AllocBytes(rows * c.intermediate_size * 4);
         }
         if (s.ok()) s = impl.d_tokens.AllocBytes(rows * sizeof(uint32_t));
+        // Batched decode staging.
+        const size_t kv_dim_sz = size_t(c.num_kv_heads) * c.head_dim;
+        if (s.ok()) {
+            s = impl.d_positions.AllocBytes(kMaxBatch * sizeof(uint32_t));
+        }
+        if (s.ok()) {
+            s = impl.d_kv_ptrs.AllocBytes(size_t(c.num_layers) * 2 *
+                                          kMaxBatch * sizeof(float*));
+        }
+        if (s.ok()) {
+            s = impl.kv_k_rows.AllocBytes(kMaxBatch * kv_dim_sz * 4);
+        }
+        if (s.ok()) {
+            s = impl.kv_v_rows.AllocBytes(kMaxBatch * kv_dim_sz * 4);
+        }
+        if (s.ok()) {
+            s = impl.batch_logits.AllocBytes(size_t(kMaxBatch) *
+                                             c.vocab_size * 4);
+        }
+        if (s.ok()) {
+            s = impl.batch_partials.AllocBytes(
+                size_t(kMaxBatch) * c.num_heads * kMaxSplits *
+                (c.head_dim + 2) * 4);
+        }
     }
     if (!s.ok()) {
         result.status = s;
@@ -1006,6 +1295,215 @@ Status QwenCudaModel::Decode(SequenceState& state, uint32_t token,
     Status s = ForwardToken(token, seq.length(), &seq, logits, true);
     if (!s.ok()) return s;
     seq.Advance();
+    return Status::Ok();
+}
+
+Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
+                                  std::vector<Status>& per_item) {
+    per_item.assign(items.size(), Status::Ok());
+    if (items.size() <= 1 || !impl_->chunked_prefill) {
+        return GenerativeModel::DecodeBatch(items, per_item);
+    }
+    const QwenConfig& c = config_;
+    Impl& impl = *impl_;
+    const int h = int(c.hidden_size);
+    const int q_dim = int(c.num_heads * c.head_dim);
+    const int kv_dim = int(c.num_kv_heads * c.head_dim);
+    const int group = int(c.num_heads / c.num_kv_heads);
+    const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
+    const int threads = 256;
+
+    LYKURO_CUDA_CHECK(cudaSetDevice(device_id_), "cuda device not usable");
+
+    // Upfront validation; invalid items are excluded from the GPU pass.
+    std::vector<size_t> valid;
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto* state = static_cast<CudaSequenceState*>(items[i].state);
+        if (items[i].token >= c.vocab_size) {
+            per_item[i] = Status(ErrorCode::kInvalidRequest,
+                                 "token id out of vocab range", kComponent);
+        } else if (state->length() >= state->capacity()) {
+            per_item[i] = Status(ErrorCode::kContextLengthExceeded,
+                                 "kv cache capacity exhausted", kComponent);
+        } else {
+            valid.push_back(i);
+        }
+    }
+
+    for (size_t group_start = 0; group_start < valid.size();
+         group_start += kMaxBatch) {
+        const uint32_t b = uint32_t(std::min<size_t>(
+            kMaxBatch, valid.size() - group_start));
+
+        uint32_t tokens[kMaxBatch];
+        uint32_t positions[kMaxBatch];
+        uint32_t max_context = 0;
+        std::vector<float*> kv_ptrs(size_t(c.num_layers) * 2 * b);
+        for (uint32_t i = 0; i < b; ++i) {
+            const size_t item_idx = valid[group_start + i];
+            auto* state =
+                static_cast<CudaSequenceState*>(items[item_idx].state);
+            tokens[i] = items[item_idx].token;
+            positions[i] = state->length();
+            max_context = std::max(max_context, positions[i] + 1);
+            for (uint32_t l = 0; l < c.num_layers; ++l) {
+                kv_ptrs[(size_t(l) * 2 + 0) * b + i] = state->KeyBase(l);
+                kv_ptrs[(size_t(l) * 2 + 1) * b + i] = state->ValueBase(l);
+            }
+        }
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(impl.d_tokens.ptr, tokens, b * sizeof(uint32_t),
+                       cudaMemcpyHostToDevice),
+            "token upload failed");
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(impl.d_positions.ptr, positions,
+                       b * sizeof(uint32_t), cudaMemcpyHostToDevice),
+            "position upload failed");
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(impl.d_kv_ptrs.ptr, kv_ptrs.data(),
+                       kv_ptrs.size() * sizeof(float*),
+                       cudaMemcpyHostToDevice),
+            "kv pointer upload failed");
+
+        // Projection dispatch: shared-staged batched GEMV amortizes
+        // weight reads for small batches; the tiled GEMM wins once the
+        // batch approaches its 16-wide tile.
+        auto project = [&](const float* x, const WeightBuffer& w,
+                           const float* bias, int in_dim, int out_dim,
+                           float* y, int ldy) {
+            if (b > 8) {
+                LaunchGemm(x, w, bias, int(b), in_dim, out_dim, y, ldy);
+            } else {
+                LaunchMatVecBatch(x, w, bias, int(b), in_dim, out_dim, y,
+                                  ldy);
+            }
+        };
+
+        int splits = (int(max_context) + 127) / 128;
+        if (splits > kMaxSplits) splits = kMaxSplits;
+        auto* positions_dev = static_cast<const uint32_t*>(
+            impl.d_positions.ptr);
+        auto* ptr_table = static_cast<float* const*>(impl.d_kv_ptrs.ptr);
+
+        if (impl.embed.bf16) {
+            GatherEmbedRowsKernel<__nv_bfloat16><<<b, threads>>>(
+                static_cast<const __nv_bfloat16*>(impl.embed.buf.ptr),
+                static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+                impl.x_rows.f32());
+        } else {
+            GatherEmbedRowsKernel<float><<<b, threads>>>(
+                static_cast<const float*>(impl.embed.buf.ptr),
+                static_cast<const uint32_t*>(impl.d_tokens.ptr), h,
+                impl.x_rows.f32());
+        }
+
+        const int rows_h = int(b) * h;
+        const int rows_i = int(b) * int(c.intermediate_size);
+        for (uint32_t l = 0; l < c.num_layers; ++l) {
+            Impl::Layer& layer = impl.layers[l];
+            float* const* k_bases = ptr_table + (size_t(l) * 2 + 0) * b;
+            float* const* v_bases = ptr_table + (size_t(l) * 2 + 1) * b;
+
+            RmsNormRowsKernel<<<b, 256>>>(
+                impl.x_rows.f32(), layer.input_norm.f32(), c.rms_norm_eps,
+                h, impl.xn_rows.f32());
+            project(impl.xn_rows.f32(), layer.q_w, layer.q_b.f32(), h,
+                    q_dim, impl.q_rows.f32(), q_dim);
+            project(impl.xn_rows.f32(), layer.k_w, layer.k_b.f32(), h,
+                    kv_dim, impl.kv_k_rows.f32(), kv_dim);
+            project(impl.xn_rows.f32(), layer.v_w, layer.v_b.f32(), h,
+                    kv_dim, impl.kv_v_rows.f32(), kv_dim);
+
+            {
+                dim3 grid_q(c.num_heads, b);
+                dim3 grid_kv(c.num_kv_heads, b);
+                RopeVarPosKernel<<<grid_q, 32>>>(impl.q_rows.f32(), q_dim,
+                                                 int(c.head_dim),
+                                                 positions_dev,
+                                                 c.rope_theta);
+                RopeVarPosKernel<<<grid_kv, 32>>>(impl.kv_k_rows.f32(),
+                                                  kv_dim, int(c.head_dim),
+                                                  positions_dev,
+                                                  c.rope_theta);
+                ScatterKvKernel<<<b, threads>>>(impl.kv_k_rows.f32(),
+                                                k_bases, positions_dev,
+                                                kv_dim);
+                ScatterKvKernel<<<b, threads>>>(impl.kv_v_rows.f32(),
+                                                v_bases, positions_dev,
+                                                kv_dim);
+                dim3 grid_attn(c.num_heads, splits, b);
+                BatchSplitAttentionKernel<<<grid_attn, kAttnThreads>>>(
+                    impl.q_rows.f32(), k_bases, v_bases, positions_dev,
+                    impl.batch_partials.f32(), int(c.head_dim), kv_dim,
+                    group, attn_scale, splits);
+                dim3 grid_combine(c.num_heads, b);
+                BatchCombineAttentionKernel<<<grid_combine, c.head_dim>>>(
+                    impl.batch_partials.f32(), impl.attn_rows.f32(),
+                    int(c.head_dim), splits);
+            }
+
+            project(impl.attn_rows.f32(), layer.o_w, nullptr, q_dim, h,
+                    impl.proj_rows.f32(), h);
+            AddKernel<<<(rows_h + threads - 1) / threads, threads>>>(
+                impl.x_rows.f32(), impl.proj_rows.f32(), rows_h);
+
+            RmsNormRowsKernel<<<b, 256>>>(
+                impl.x_rows.f32(), layer.post_norm.f32(), c.rms_norm_eps,
+                h, impl.xn_rows.f32());
+            project(impl.xn_rows.f32(), layer.gate_w, nullptr, h,
+                    int(c.intermediate_size), impl.gate_rows.f32(),
+                    int(c.intermediate_size));
+            project(impl.xn_rows.f32(), layer.up_w, nullptr, h,
+                    int(c.intermediate_size), impl.up_rows.f32(),
+                    int(c.intermediate_size));
+            SwigluKernel<<<(rows_i + threads - 1) / threads, threads>>>(
+                impl.gate_rows.f32(), impl.up_rows.f32(), rows_i);
+            project(impl.gate_rows.f32(), layer.down_w, nullptr,
+                    int(c.intermediate_size), h, impl.proj_rows.f32(),
+                    h);
+            AddKernel<<<(rows_h + threads - 1) / threads, threads>>>(
+                impl.x_rows.f32(), impl.proj_rows.f32(), rows_h);
+        }
+
+        RmsNormRowsKernel<<<b, 256>>>(impl.x_rows.f32(),
+                                      impl.final_norm.f32(),
+                                      c.rms_norm_eps, h,
+                                      impl.xn_rows.f32());
+        const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+        project(impl.xn_rows.f32(), head, nullptr, h, int(c.vocab_size),
+                impl.batch_logits.f32(), int(c.vocab_size));
+
+        std::vector<float> host_logits(size_t(b) * c.vocab_size);
+        LYKURO_CUDA_CHECK(
+            cudaMemcpy(host_logits.data(), impl.batch_logits.ptr,
+                       host_logits.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "logits download failed");
+        LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
+
+        for (uint32_t i = 0; i < b; ++i) {
+            const size_t item_idx = valid[group_start + i];
+            auto* state =
+                static_cast<CudaSequenceState*>(items[item_idx].state);
+            std::vector<float>& out = *items[item_idx].logits;
+            out.assign(host_logits.begin() + size_t(i) * c.vocab_size,
+                       host_logits.begin() + size_t(i + 1) * c.vocab_size);
+            bool finite = true;
+            for (float v : out) {
+                if (!std::isfinite(v)) {
+                    finite = false;
+                    break;
+                }
+            }
+            if (!finite) {
+                per_item[item_idx] =
+                    Status(ErrorCode::kInferenceFailed,
+                           "logits contain non-finite values", kComponent);
+            } else {
+                state->Advance();
+            }
+        }
+    }
     return Status::Ok();
 }
 

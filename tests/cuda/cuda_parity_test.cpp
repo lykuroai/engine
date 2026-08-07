@@ -185,6 +185,80 @@ TEST_F(CudaParityTest, EngineOutputMatchesCpuEngine) {
     EXPECT_FALSE(cuda_text.empty());
 }
 
+// Batched decode must match per-sequence decode: same greedy tokens and
+// logits within reordering tolerance (batch GEMM sums in tiled order).
+TEST_F(CudaParityTest, BatchedDecodeMatchesSequentialDecode) {
+    const std::vector<std::vector<uint32_t>> prompts = {
+        {1, 5, 9}, {17, 4, 22, 8, 30}, {7, 7, 25}};
+    const size_t n = prompts.size();
+
+    // Sequential baseline.
+    std::vector<std::unique_ptr<SequenceState>> seq_states(n);
+    std::vector<std::vector<float>> seq_logits(n);
+    for (size_t i = 0; i < n; ++i) {
+        ASSERT_TRUE(cuda_->CreateSequence(64, seq_states[i]).ok());
+        ASSERT_TRUE(
+            cuda_->Prefill(*seq_states[i], prompts[i], seq_logits[i]).ok());
+    }
+
+    // Batched run.
+    std::vector<std::unique_ptr<SequenceState>> bat_states(n);
+    std::vector<std::vector<float>> bat_logits(n);
+    for (size_t i = 0; i < n; ++i) {
+        ASSERT_TRUE(cuda_->CreateSequence(64, bat_states[i]).ok());
+        ASSERT_TRUE(
+            cuda_->Prefill(*bat_states[i], prompts[i], bat_logits[i]).ok());
+    }
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    for (int step = 0; step < 12; ++step) {
+        std::vector<uint32_t> seq_tokens(n), bat_tokens(n);
+        for (size_t i = 0; i < n; ++i) {
+            Sampler s1(greedy), s2(greedy);
+            ASSERT_TRUE(s1.Sample(seq_logits[i], seq_tokens[i]).ok());
+            ASSERT_TRUE(s2.Sample(bat_logits[i], bat_tokens[i]).ok());
+            ASSERT_EQ(seq_tokens[i], bat_tokens[i])
+                << "greedy divergence seq " << i << " step " << step;
+            ExpectClose(seq_logits[i], bat_logits[i], 2e-3f,
+                        "batch vs sequential logits");
+        }
+        for (size_t i = 0; i < n; ++i) {
+            ASSERT_TRUE(cuda_->Decode(*seq_states[i], seq_tokens[i],
+                                      seq_logits[i])
+                            .ok());
+        }
+        std::vector<GenerativeModel::DecodeBatchItem> items;
+        for (size_t i = 0; i < n; ++i) {
+            items.push_back(
+                {bat_states[i].get(), bat_tokens[i], &bat_logits[i]});
+        }
+        std::vector<Status> per_item;
+        ASSERT_TRUE(cuda_->DecodeBatch(items, per_item).ok());
+        for (const Status& s : per_item) ASSERT_TRUE(s.ok());
+    }
+}
+
+TEST_F(CudaParityTest, BatchedDecodeIsolatesInvalidItems) {
+    std::unique_ptr<SequenceState> good, full;
+    ASSERT_TRUE(cuda_->CreateSequence(64, good).ok());
+    ASSERT_TRUE(cuda_->CreateSequence(3, full).ok());
+    std::vector<float> good_logits, full_logits;
+    ASSERT_TRUE(cuda_->Prefill(*good, {1, 2}, good_logits).ok());
+    ASSERT_TRUE(cuda_->Prefill(*full, {1, 2, 3}, full_logits).ok());
+
+    std::vector<GenerativeModel::DecodeBatchItem> items = {
+        {good.get(), 5, &good_logits},
+        {full.get(), 6, &full_logits},   // capacity exhausted
+        {good.get(), 99999, &good_logits},  // invalid token
+    };
+    std::vector<Status> per_item;
+    ASSERT_TRUE(cuda_->DecodeBatch(items, per_item).ok());
+    EXPECT_TRUE(per_item[0].ok());
+    EXPECT_EQ(per_item[1].code(), ErrorCode::kContextLengthExceeded);
+    EXPECT_EQ(per_item[2].code(), ErrorCode::kInvalidRequest);
+}
+
 // Not a certified benchmark (tiny random model): records rough
 // tokens/second so the pipeline exists for real certified profiles.
 TEST_F(CudaParityTest, DecodeThroughputSmoke) {

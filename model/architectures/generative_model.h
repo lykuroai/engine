@@ -48,6 +48,27 @@ public:
     // Appends one token and returns logits for the next position.
     virtual Status Decode(SequenceState& state, uint32_t token,
                           std::vector<float>& logits) = 0;
+
+    struct DecodeBatchItem {
+        SequenceState* state = nullptr;
+        uint32_t token = 0;
+        std::vector<float>* logits = nullptr;  // output
+    };
+
+    // Decodes one token for each sequence in a single pass when the
+    // backend supports it (weight reads amortized across sequences).
+    // Contract: an item's sequence advances only when its per_item status
+    // is ok; on a non-ok overall return, NO sequence advanced, so the
+    // caller may retry items individually (idempotent by construction).
+    virtual Status DecodeBatch(std::vector<DecodeBatchItem>& items,
+                               std::vector<Status>& per_item) {
+        per_item.resize(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            per_item[i] =
+                Decode(*items[i].state, items[i].token, *items[i].logits);
+        }
+        return Status::Ok();
+    }
 };
 
 }  // namespace lykuro::nie

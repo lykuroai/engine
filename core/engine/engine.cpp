@@ -401,6 +401,9 @@ void InferenceEngine::AdmitPending(int64_t now) {
 }
 
 void InferenceEngine::DecodeIteration(int64_t now) {
+    // (request_id, sampled token) for sequences that continue decoding.
+    std::vector<std::pair<std::string, uint32_t>> pending_decode;
+
     for (size_t i = active_.size(); i > 0; --i) {
         const size_t index = i - 1;
         ActiveSequence& seq = active_[index];
@@ -464,11 +467,48 @@ void InferenceEngine::DecodeIteration(int64_t now) {
             continue;
         }
 
-        s = model_->Decode(*seq.state, token, seq.logits);
-        if (!s.ok()) {
-            FailSequence(index, std::move(s));
-            continue;
+        pending_decode.emplace_back(req.request_id, token);
+    }
+
+    if (pending_decode.empty()) return;
+
+    // Resolve surviving sequences by id (indices may have shifted as
+    // finished sequences were erased above).
+    std::vector<size_t> indices;
+    std::vector<GenerativeModel::DecodeBatchItem> items;
+    for (const auto& [request_id, token] : pending_decode) {
+        for (size_t idx = 0; idx < active_.size(); ++idx) {
+            if (active_[idx].request->request_id == request_id) {
+                items.push_back({active_[idx].state.get(), token,
+                                 &active_[idx].logits});
+                indices.push_back(idx);
+                break;
+            }
         }
+    }
+
+    std::vector<Status> per_item;
+    Status batch = model_->DecodeBatch(items, per_item);
+    if (!batch.ok()) {
+        // Contract: nothing advanced. Retry individually (idempotent) so
+        // only genuinely failing sequences are failed.
+        per_item.resize(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            per_item[i] = model_->Decode(*items[i].state, items[i].token,
+                                         *items[i].logits);
+        }
+    }
+    // Fail errored sequences in descending index order so erasures do not
+    // invalidate the remaining indices.
+    std::vector<size_t> failing;
+    for (size_t k = 0; k < indices.size(); ++k) {
+        if (!per_item[k].ok()) failing.push_back(k);
+    }
+    std::sort(failing.begin(), failing.end(), [&](size_t a, size_t b) {
+        return indices[a] > indices[b];
+    });
+    for (size_t k : failing) {
+        FailSequence(indices[k], std::move(per_item[k]));
     }
 }
 

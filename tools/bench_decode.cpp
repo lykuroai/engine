@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
     const std::string backend = argv[2];
     const int steps = argc > 3 ? std::atoi(argv[3]) : 128;
     const int prompt_repeat = argc > 4 ? std::atoi(argv[4]) : 1;
+    const int batch = argc > 5 ? std::atoi(argv[5]) : 1;
 
     ArtifactLoadOptions options;
     options.allow_unsigned_dev = true;
@@ -69,33 +70,52 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::unique_ptr<SequenceState> state;
-    s = model->CreateSequence(uint32_t(prompt.size()) + steps + 8, state);
-    if (!s.ok()) {
-        std::fprintf(stderr, "sequence alloc failed: %s\n",
-                     s.message().c_str());
-        return 1;
+    std::vector<std::unique_ptr<SequenceState>> states(batch);
+    std::vector<std::vector<float>> logits(batch);
+    std::vector<uint32_t> tokens(batch);
+    for (int i = 0; i < batch; ++i) {
+        s = model->CreateSequence(uint32_t(prompt.size()) + steps + 8,
+                                  states[i]);
+        if (!s.ok()) {
+            std::fprintf(stderr, "sequence alloc failed: %s\n",
+                         s.message().c_str());
+            return 1;
+        }
     }
 
-    std::vector<float> logits;
-    auto t0 = std::chrono::steady_clock::now();
-    s = model->Prefill(*state, prompt, logits);
-    if (!s.ok()) {
-        std::fprintf(stderr, "prefill failed: %s\n", s.message().c_str());
-        return 1;
-    }
     SamplingParams greedy;
     greedy.temperature = 0.0f;
-    Sampler sampler(greedy);
-    uint32_t token = 0;
-    if (!sampler.Sample(logits, token).ok()) return 1;
+    std::vector<Sampler> samplers(batch, Sampler(greedy));
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < batch; ++i) {
+        s = model->Prefill(*states[i], prompt, logits[i]);
+        if (!s.ok()) {
+            std::fprintf(stderr, "prefill failed: %s\n",
+                         s.message().c_str());
+            return 1;
+        }
+        if (!samplers[i].Sample(logits[i], tokens[i]).ok()) return 1;
+    }
     auto t1 = std::chrono::steady_clock::now();
 
     int produced = 0;
-    for (int i = 0; i < steps; ++i) {
-        if (!model->Decode(*state, token, logits).ok()) break;
-        if (!sampler.Sample(logits, token).ok()) break;
-        ++produced;
+    for (int step = 0; step < steps; ++step) {
+        std::vector<GenerativeModel::DecodeBatchItem> items;
+        for (int i = 0; i < batch; ++i) {
+            items.push_back({states[i].get(), tokens[i], &logits[i]});
+        }
+        std::vector<Status> per_item;
+        if (!model->DecodeBatch(items, per_item).ok()) break;
+        bool all_ok = true;
+        for (int i = 0; i < batch; ++i) {
+            if (!per_item[i].ok() ||
+                !samplers[i].Sample(logits[i], tokens[i]).ok()) {
+                all_ok = false;
+            }
+        }
+        if (!all_ok) break;
+        produced += batch;
     }
     auto t2 = std::chrono::steady_clock::now();
 
@@ -106,9 +126,10 @@ int main(int argc, char** argv) {
     };
     const double decode_ms = ms(t1, t2);
     std::printf(
-        "backend=%s load_ms=%.0f prompt_tokens=%zu ttft_ms=%.1f "
+        "backend=%s batch=%d load_ms=%.0f prompt_tokens=%zu ttft_ms=%.1f "
         "decode_tokens=%d decode_ms=%.1f tokens_per_s=%.1f\n",
-        backend.c_str(), ms(t_load0, t_load1), prompt.size(), ms(t0, t1),
-        produced, decode_ms, produced * 1000.0 / decode_ms);
+        backend.c_str(), batch, ms(t_load0, t_load1), prompt.size(),
+        ms(t0, t1) / batch, produced, decode_ms,
+        produced * 1000.0 / decode_ms);
     return 0;
 }
