@@ -1,6 +1,8 @@
 #include "api/server/grpc_server.h"
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
 
 #include "lykuro/nie/v1/control.grpc.pb.h"
 #include "lykuro/nie/v1/data.grpc.pb.h"
@@ -121,7 +123,61 @@ Status FromProtoRequest(const pb::GenerateRequest& proto,
     return Status::Ok();
 }
 
+// Peer identity check against an allowlist of certificate common names.
+// An empty allowlist disables the check (development only).
+grpc::Status Authorize(grpc::ServerContext* context,
+                       const std::vector<std::string>& allowed) {
+    if (allowed.empty()) return grpc::Status::OK;
+    auto auth = context->auth_context();
+    if (auth) {
+        for (const grpc::string_ref& value :
+             auth->FindPropertyValues("x509_common_name")) {
+            std::string cn(value.data(), value.size());
+            for (const std::string& id : allowed) {
+                if (cn == id) return grpc::Status::OK;
+            }
+        }
+    }
+    return grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
+                        "authentication_failed");
+}
+
+Status ReadPemFile(const std::string& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return Status(ErrorCode::kInternalError,
+                      "credential file cannot be opened", "api");
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    out = ss.str();
+    return Status::Ok();
+}
+
 }  // namespace
+
+Status MakeMtlsServerCredentials(
+    const std::string& server_cert_pem_path,
+    const std::string& server_key_pem_path,
+    const std::string& client_ca_pem_path,
+    std::shared_ptr<grpc::ServerCredentials>& out) {
+    std::string cert, key, ca;
+    Status s = ReadPemFile(server_cert_pem_path, cert);
+    if (s.ok()) s = ReadPemFile(server_key_pem_path, key);
+    if (s.ok()) s = ReadPemFile(client_ca_pem_path, ca);
+    if (!s.ok()) return s;
+
+    grpc::SslServerCredentialsOptions options(
+        GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
+    options.pem_root_certs = ca;
+    options.pem_key_cert_pairs.push_back({key, cert});
+    out = grpc::SslServerCredentials(options);
+    if (!out) {
+        return Status(ErrorCode::kInternalError,
+                      "mtls credentials rejected", "api");
+    }
+    return Status::Ok();
+}
 
 // ---------------------------------------------------------------- Data API
 
@@ -129,9 +185,12 @@ class EngineServer::DataServiceImpl final : public pb::DataService::Service {
 public:
     explicit DataServiceImpl(EngineServer* server) : server_(server) {}
 
-    grpc::Status Generate(grpc::ServerContext*,
+    grpc::Status Generate(grpc::ServerContext* context,
                           const pb::GenerateRequest* request,
                           pb::GenerateResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.data_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         if (engine == nullptr) {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
@@ -181,6 +240,9 @@ public:
     grpc::Status GenerateStream(
         grpc::ServerContext* context, const pb::GenerateRequest* request,
         grpc::ServerWriter<pb::StreamEvent>* writer) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.data_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         if (engine == nullptr) {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
@@ -245,8 +307,12 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status Cancel(grpc::ServerContext*, const pb::CancelRequest* request,
+    grpc::Status Cancel(grpc::ServerContext* context,
+                        const pb::CancelRequest* request,
                         pb::CancelResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.data_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         response->set_found(engine != nullptr &&
                             engine->Cancel(request->request_id()));
@@ -260,9 +326,12 @@ public:
                             "count_tokens lands with the tokenizer service");
     }
 
-    grpc::Status GetCapabilities(grpc::ServerContext*,
+    grpc::Status GetCapabilities(grpc::ServerContext* context,
                                  const pb::GetCapabilitiesRequest*,
                                  pb::GetCapabilitiesResponse* out) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.data_identities);
+        if (!auth.ok()) return auth;
         out->set_engine_version("0.1.0");
         out->set_engine_abi("nie_abi_1");
         out->set_streaming(true);
@@ -292,9 +361,12 @@ class EngineServer::ControlServiceImpl final
 public:
     explicit ControlServiceImpl(EngineServer* server) : server_(server) {}
 
-    grpc::Status LoadModel(grpc::ServerContext*,
+    grpc::Status LoadModel(grpc::ServerContext* context,
                            const pb::LoadModelRequest* request,
                            pb::LoadModelResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         Status s = server_->LoadModel(request->artifact_path());
         if (!s.ok()) {
             response->set_state(pb::MODEL_STATE_FAILED);
@@ -318,16 +390,22 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status UnloadModel(grpc::ServerContext*,
+    grpc::Status UnloadModel(grpc::ServerContext* context,
                              const pb::UnloadModelRequest*,
                              pb::UnloadModelResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         server_->UnloadModel();
         response->set_state(pb::MODEL_STATE_UNLOADED);
         return grpc::Status::OK;
     }
 
-    grpc::Status Drain(grpc::ServerContext*, const pb::DrainRequest*,
+    grpc::Status Drain(grpc::ServerContext* context, const pb::DrainRequest*,
                        pb::DrainResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         if (engine != nullptr) {
             engine->StartDrain();
@@ -337,17 +415,23 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status Resume(grpc::ServerContext*, const pb::ResumeRequest*,
+    grpc::Status Resume(grpc::ServerContext* context, const pb::ResumeRequest*,
                         pb::ResumeResponse* response) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         if (engine != nullptr) engine->Resume();
         response->set_accepting(engine != nullptr);
         return grpc::Status::OK;
     }
 
-    grpc::Status GetModelStatus(grpc::ServerContext*,
+    grpc::Status GetModelStatus(grpc::ServerContext* context,
                                 const pb::GetModelStatusRequest*,
                                 pb::GetModelStatusResponse* out) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         const ModelManifest* manifest = server_->manifest();
         if (engine == nullptr || manifest == nullptr) {
@@ -363,8 +447,12 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status GetCapacity(grpc::ServerContext*, const pb::GetCapacityRequest*,
+    grpc::Status GetCapacity(grpc::ServerContext* context,
+                             const pb::GetCapacityRequest*,
                              pb::GetCapacityResponse* out) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         InferenceEngine* engine = server_->engine();
         const ModelManifest* manifest = server_->manifest();
         if (engine != nullptr && manifest != nullptr) {
@@ -377,8 +465,12 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status GetManifest(grpc::ServerContext*, const pb::GetManifestRequest*,
+    grpc::Status GetManifest(grpc::ServerContext* context,
+                             const pb::GetManifestRequest*,
                              pb::GetManifestResponse* out) override {
+        grpc::Status auth =
+            Authorize(context, server_->config_.control_identities);
+        if (!auth.ok()) return auth;
         const ModelManifest* manifest = server_->manifest();
         if (manifest == nullptr) {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,

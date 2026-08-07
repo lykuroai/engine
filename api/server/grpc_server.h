@@ -13,13 +13,29 @@
 namespace lykuro::nie {
 
 struct ServerConfig {
-    // MVP binds loopback only; production fronts this with mTLS creds
+    // Binds loopback by default; production fronts this with mTLS creds
     // (spec §9.1). Never a public interface.
     std::string listen_address = "127.0.0.1:0";
     std::shared_ptr<grpc::ServerCredentials> credentials;  // required
+
+    // Service identity allowlists, matched against the peer certificate
+    // common name (spec §8.2: Control API is Model Manager only; Gateway
+    // identities are rejected there). Empty list = no identity check
+    // (development / insecure credentials only).
+    std::vector<std::string> control_identities;
+    std::vector<std::string> data_identities;
+
     EngineConfig engine;
     ArtifactLoadOptions load_options;
 };
+
+// Builds mTLS server credentials: server cert/key plus the client CA,
+// with client certificate REQUIRED and verified.
+Status MakeMtlsServerCredentials(
+    const std::string& server_cert_pem_path,
+    const std::string& server_key_pem_path,
+    const std::string& client_ca_pem_path,
+    std::shared_ptr<grpc::ServerCredentials>& out);
 
 // Hosts one InferenceEngine behind the Data/Control gRPC services and
 // drives it from a single worker thread (spec §7.1 GPU worker analogue

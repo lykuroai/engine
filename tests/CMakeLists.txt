@@ -30,9 +30,12 @@ gtest_discover_tests(unit_tests)
 if(LYKURO_ENABLE_GRPC)
     add_executable(grpc_tests
         integration/grpc_server_test.cpp
+        integration/mtls_test.cpp
         testutil/tiny_model.cpp
         unit/tokenizer_fixture.cpp
     )
+    target_compile_definitions(grpc_tests PRIVATE
+        LYKURO_TEST_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/certs")
     target_link_libraries(grpc_tests
         PRIVATE lykuro_api lykuro_engine lykuro_model lykuro_security
                 lykuro_backend_cpu lykuro_options
