@@ -13,10 +13,14 @@ add_executable(unit_tests
     unit/stop_test.cpp
     unit/qwen_model_test.cpp
     golden/golden_test.cpp
+    unit/scheduler_test.cpp
+    unit/event_channel_test.cpp
+    testutil/tiny_model.cpp
+    integration/engine_test.cpp
 )
 target_link_libraries(unit_tests
-    PRIVATE lykuro_core lykuro_model lykuro_security lykuro_backend_cpu
-            lykuro_options GTest::gtest GTest::gtest_main)
+    PRIVATE lykuro_core lykuro_engine lykuro_model lykuro_security
+            lykuro_backend_cpu lykuro_options GTest::gtest GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests)
