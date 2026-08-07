@@ -81,20 +81,22 @@ artifact 化し、HF transformers FP32 を oracle として照合
   fp32 accumulate 自前 GEMV、cuBLAS 撤去)後の実測(Qwen2.5-0.5B、
   single sequence、dev 計測値):
 
-  RTX 3060(sm_86)、chunked GEMM prefill + bf16 GEMV decode:
+  RTX 3060(sm_86)、chunked GEMM prefill + bf16 GEMV decode +
+  split-K(flash-decoding 方式)attention:
 
   | prompt tokens | TTFT | decode tok/s |
   |---:|---:|---:|
-  | 19 | 41 ms | 149 |
-  | 329 | 429 ms | 109 |
-  | 1289 | 2.2 s(prefill 584 tok/s) | 58 |
+  | 19 | 41 ms | 152 |
+  | 329 | 423 ms | 146 |
+  | 1289 | 2.2 s(prefill 584 tok/s) | 136 |
+  | 2569 | 5.9 s | 125 |
 
   GTX 1650(sm_75): 短 prompt で decode 67 tok/s。
-  最適化前(fp32 weight + cuBLAS SGEMV、逐次 prefill)は decode
-  約 18 tok/s、TTFT 85 ms(18 tok)。数値は §25.3 の完全な benchmark
-  (concurrent / soak / saturation)を経ていないため certified profile
-  としては未発行。multi-sequence batched decode・長 context 時の
-  attention 最適化・paged KV・量子化は今後の Phase 4 継続項目。
+  最適化前(fp32 weight + cuBLAS SGEMV、逐次 prefill、単純 attention)
+  は decode 約 18 tok/s、TTFT 85 ms(18 tok)、ctx 1289 で 58 tok/s。
+  数値は §25.3 の完全な benchmark(concurrent / soak / saturation)を
+  経ていないため certified profile としては未発行。multi-sequence
+  batched decode・paged KV・量子化は今後の Phase 4 継続項目。
 - **外部 oracle との correctness 照合**: golden test は本実装の再現性
   anchor であり、HF transformers 等の独立 oracle との照合は実 Qwen
   checkpoint 入手後に実施する。

@@ -120,51 +120,139 @@ __global__ void RopeKernel(float* vec, int head_dim, uint32_t pos,
     }
 }
 
-__global__ void AttentionKernel(const float* q, const float* k_cache,
-                                const float* v_cache, float* scores,
-                                float* out, int context, int head_dim,
-                                int kv_stride, int group, int max_context,
-                                float scale) {
+// ---- split-K decode attention (long-context path) ----
+//
+// The context is divided into up to kMaxSplits contiguous segments; each
+// (head, split) block computes a partial softmax over its segment
+// (segment max, partial denominator, partial weighted value sum), and a
+// combine kernel merges partials in fixed split order. All reductions use
+// fixed-order loops, so results are deterministic run-to-run.
+
+constexpr int kMaxSplits = 32;
+constexpr int kMaxSegment = 1024;  // ceil(32768 / 32); shared score cap
+constexpr int kAttnThreads = 128;
+
+// Partials layout per (head, split): [head_dim floats acc][m][denom].
+__global__ void SplitAttentionKernel(const float* __restrict__ q,
+                                     const float* __restrict__ k_cache,
+                                     const float* __restrict__ v_cache,
+                                     float* __restrict__ partials,
+                                     int context, int head_dim,
+                                     int kv_stride, int group, float scale,
+                                     int splits) {
+    __shared__ float scores[kMaxSegment];
+    __shared__ float red[kAttnThreads];
     const int head = blockIdx.x;
+    const int split = blockIdx.y;
     const int kv_head = head / group;
     const float* qh = q + head * head_dim;
-    float* row = scores + size_t(head) * max_context;
+    float* part =
+        partials + (size_t(head) * kMaxSplits + split) * (head_dim + 2);
 
-    for (int t = threadIdx.x; t < context; t += blockDim.x) {
-        const float* kt = k_cache + size_t(t) * kv_stride +
-                          kv_head * head_dim;
+    const int seg = (context + splits - 1) / splits;
+    const int t0 = split * seg;
+    const int t1 = min(context, t0 + seg);
+    const int len = t1 - t0;
+    if (len <= 0) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            part[d] = 0.0f;
+        }
+        if (threadIdx.x == 0) {
+            part[head_dim] = -1e30f;  // m
+            part[head_dim + 1] = 0.0f;  // denom
+        }
+        return;
+    }
+
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        const float* kt =
+            k_cache + size_t(t0 + j) * kv_stride + kv_head * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) {
             dot += qh[d] * kt[d];
         }
-        row[t] = dot * scale;
+        scores[j] = dot * scale;
     }
     __syncthreads();
 
-    __shared__ float denom_s;
-    if (threadIdx.x == 0) {
-        float max_score = row[0];
-        for (int t = 1; t < context; ++t) {
-            max_score = fmaxf(max_score, row[t]);
-        }
-        float denom = 0.0f;
-        for (int t = 0; t < context; ++t) {
-            row[t] = expf(row[t] - max_score);
-            denom += row[t];
-        }
-        denom_s = denom;
+    // Segment max (per-thread subset max, then fixed-order tree reduce).
+    float local_max = -1e30f;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        local_max = fmaxf(local_max, scores[j]);
     }
+    red[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] = fmaxf(red[threadIdx.x],
+                                     red[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float m = red[0];
     __syncthreads();
 
-    float* oh = out + head * head_dim;
+    // exp + partial denominator.
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        scores[j] = expf(scores[j] - m);
+        local_sum += scores[j];
+    }
+    red[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = red[0];
+
+    // Partial weighted value sum, parallel over head_dim lanes.
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < context; ++t) {
-            const float* vt = v_cache + size_t(t) * kv_stride +
-                              kv_head * head_dim;
-            acc += (row[t] / denom_s) * vt[d];
+        for (int j = 0; j < len; ++j) {
+            const float* vt =
+                v_cache + size_t(t0 + j) * kv_stride + kv_head * head_dim;
+            acc += scores[j] * vt[d];
         }
-        oh[d] = acc;
+        part[d] = acc;
+    }
+    if (threadIdx.x == 0) {
+        part[head_dim] = m;
+        part[head_dim + 1] = denom;
+    }
+}
+
+// Merges split partials in fixed order. grid.x = head.
+__global__ void CombineAttentionKernel(const float* __restrict__ partials,
+                                       float* __restrict__ out,
+                                       int head_dim, int splits) {
+    const int head = blockIdx.x;
+    const float* base =
+        partials + size_t(head) * kMaxSplits * (head_dim + 2);
+    __shared__ float m_glob, denom_glob;
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int s = 0; s < splits; ++s) {
+            m = fmaxf(m, base[size_t(s) * (head_dim + 2) + head_dim]);
+        }
+        float denom = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const float* p = base + size_t(s) * (head_dim + 2);
+            denom += p[head_dim + 1] * expf(p[head_dim] - m);
+        }
+        m_glob = m;
+        denom_glob = denom;
+    }
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const float* p = base + size_t(s) * (head_dim + 2);
+            acc += p[d] * expf(p[head_dim] - m_glob);
+        }
+        out[head * head_dim + d] = acc / denom_glob;
     }
 }
 
@@ -468,7 +556,8 @@ struct QwenCudaModel::Impl {
     WeightBuffer lm_head;  // unset when tied (embed is used)
     bool tied = true;
 
-    DeviceBuffer hidden, normed, q, attn_out, proj, gate, up, logits, scores;
+    DeviceBuffer hidden, normed, q, attn_out, proj, gate, up, logits;
+    DeviceBuffer attn_partials;  // [heads, kMaxSplits, head_dim + 2]
 
     // Chunked-prefill work buffers ([kChunk, dim] rows) and token staging.
     DeviceBuffer x_rows, xn_rows, q_rows, attn_rows, proj_rows, gate_rows,
@@ -595,8 +684,8 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(const ModelManifest& manifest,
     if (s.ok()) s = impl.up.AllocBytes(c.intermediate_size * sizeof(float));
     if (s.ok()) s = impl.logits.AllocBytes(c.vocab_size * sizeof(float));
     if (s.ok()) {
-        s = impl.scores.AllocBytes(size_t(c.num_heads) *
-                                   c.max_context_tokens * sizeof(float));
+        s = impl.attn_partials.AllocBytes(size_t(c.num_heads) * kMaxSplits *
+                                          (c.head_dim + 2) * sizeof(float));
     }
 
     // Chunked prefill needs blockDim == head_dim in the attention kernel.
@@ -682,11 +771,19 @@ Status QwenCudaModel::ForwardToken(uint32_t token, uint32_t pos,
                                         c.rope_theta);
         RopeKernel<<<c.num_kv_heads, 32>>>(k_dst, int(c.head_dim), pos,
                                            c.rope_theta);
-        AttentionKernel<<<c.num_heads, 128>>>(
-            impl.q.f32(), state.KeyBase(l), state.ValueBase(l),
-            impl.scores.f32(), impl.attn_out.f32(), int(pos + 1),
-            int(c.head_dim), kv_dim, group, int(c.max_context_tokens),
-            attn_scale);
+        {
+            const int context = int(pos + 1);
+            int splits = (context + 127) / 128;
+            if (splits > kMaxSplits) splits = kMaxSplits;
+            dim3 grid(c.num_heads, splits);
+            SplitAttentionKernel<<<grid, kAttnThreads>>>(
+                impl.q.f32(), state.KeyBase(l), state.ValueBase(l),
+                impl.attn_partials.f32(), context, int(c.head_dim), kv_dim,
+                group, attn_scale, splits);
+            CombineAttentionKernel<<<c.num_heads, c.head_dim>>>(
+                impl.attn_partials.f32(), impl.attn_out.f32(),
+                int(c.head_dim), splits);
+        }
 
         LaunchMatVec(layer.o_w, impl.attn_out.f32(), nullptr, q_dim, h,
                      impl.proj.f32());
