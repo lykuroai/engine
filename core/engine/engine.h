@@ -77,7 +77,10 @@ public:
     SubmitResult Submit(const InferenceRequest& request);
 
     // Idempotent cancel across queued and active stages (spec §19.2).
-    void Cancel(const std::string& request_id);
+    // Returns false when the request id was never seen.
+    bool Cancel(const std::string& request_id);
+
+    const QwenConfig& model_config() const { return model_->config(); }
 
     // Runs one scheduler+decode iteration. Returns true while work remains.
     bool Step();

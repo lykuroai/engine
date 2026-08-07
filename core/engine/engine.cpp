@@ -134,11 +134,11 @@ InferenceEngine::SubmitResult InferenceEngine::Submit(
     return result;
 }
 
-void InferenceEngine::Cancel(const std::string& request_id) {
+bool InferenceEngine::Cancel(const std::string& request_id) {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto it = cancel_flags_.find(request_id);
-        if (it == cancel_flags_.end()) return;  // idempotent
+        if (it == cancel_flags_.end()) return false;  // idempotent
         it->second = true;
     }
     // Queued requests can be removed immediately; active ones are
@@ -165,6 +165,7 @@ void InferenceEngine::Cancel(const std::string& request_id) {
             channel->Close();
         }
     }
+    return true;
 }
 
 void InferenceEngine::StartDrain() {

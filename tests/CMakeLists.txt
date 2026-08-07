@@ -24,3 +24,16 @@ target_link_libraries(unit_tests
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests)
+
+if(LYKURO_ENABLE_GRPC)
+    add_executable(grpc_tests
+        integration/grpc_server_test.cpp
+        testutil/tiny_model.cpp
+        unit/tokenizer_fixture.cpp
+    )
+    target_link_libraries(grpc_tests
+        PRIVATE lykuro_api lykuro_engine lykuro_model lykuro_security
+                lykuro_backend_cpu lykuro_options
+                GTest::gtest GTest::gtest_main)
+    gtest_discover_tests(grpc_tests)
+endif()

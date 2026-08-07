@@ -1,6 +1,7 @@
 add_library(lykuro_model STATIC
     manifest/manifest.cpp
     loader/safetensors.cpp
+    loader/artifact_loader.cpp
     tokenizer/bpe_tokenizer.cpp
     tokenizer/prompt_template.cpp
     architectures/qwen/qwen_model.cpp
