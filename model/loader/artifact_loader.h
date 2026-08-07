@@ -7,14 +7,18 @@
 #include "model/architectures/qwen/qwen_model.h"
 #include "model/manifest/manifest.h"
 #include "model/tokenizer/bpe_tokenizer.h"
+#include "security/signature.h"
 
 namespace lykuro::nie {
 
 struct ArtifactLoadOptions {
-    // Development escape hatch: production builds must require a valid
-    // manifest signature. Signature verification lands in Phase 3; until
-    // then loads are refused unless this flag is explicitly set, so an
-    // unsigned artifact can never load by default (spec §0.2).
+    // Ed25519 public keys trusted to sign manifests. When set, the
+    // artifact's manifest.sig must verify over the exact manifest.json
+    // bytes with one of these keys.
+    TrustedKeys trusted_keys;
+    // Development escape hatch: skips signature verification entirely.
+    // Must never be set in production; with neither trusted keys nor this
+    // flag, every load is refused (fail-closed, spec §0.2).
     bool allow_unsigned_dev = false;
     uint64_t max_manifest_bytes = 1 << 20;
     uint64_t max_tokenizer_bytes = 64ull << 20;

@@ -82,11 +82,11 @@ ArtifactLoadResult LoadArtifact(const std::string& artifact_dir,
                                 const ArtifactLoadOptions& options) {
     ArtifactLoadResult result;
 
-    // Phase 3 will verify manifest.sig against the trusted key set; until
-    // that lands, refuse to load unless explicitly in dev mode.
-    if (!options.allow_unsigned_dev) {
+    const bool has_trusted_keys = !options.trusted_keys.keys.empty();
+    if (!has_trusted_keys && !options.allow_unsigned_dev) {
+        // Fail-closed: without a trust anchor there is no valid load.
         result.status = VerifyFailed(
-            "signature verification unavailable; refusing unsigned load");
+            "no trusted signing keys configured; refusing load");
         return result;
     }
 
@@ -94,6 +94,21 @@ ArtifactLoadResult LoadArtifact(const std::string& artifact_dir,
     result.status = ReadFileCapped(artifact_dir + "/manifest.json",
                                    options.max_manifest_bytes, manifest_text);
     if (!result.status.ok()) return result;
+
+    if (has_trusted_keys) {
+        // manifest.sig: hex Ed25519 signature over the manifest bytes.
+        std::string sig_text;
+        result.status = ReadFileCapped(artifact_dir + "/manifest.sig", 4096,
+                                       sig_text);
+        if (!result.status.ok()) return result;
+        while (!sig_text.empty() &&
+               (sig_text.back() == '\n' || sig_text.back() == '\r')) {
+            sig_text.pop_back();
+        }
+        result.status = VerifyManifestSignature(manifest_text, sig_text,
+                                                options.trusted_keys);
+        if (!result.status.ok()) return result;
+    }
 
     ManifestParseResult manifest =
         ParseManifest(manifest_text, options.max_manifest_bytes);

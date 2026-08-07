@@ -33,6 +33,7 @@ if(LYKURO_ENABLE_GRPC)
 endif()
 add_subdirectory(observability)
 add_subdirectory(cmd/native-engine)
+add_subdirectory(tools)
 
 if(LYKURO_BUILD_TESTS)
     enable_testing()

@@ -3,6 +3,7 @@ find_package(GTest REQUIRED)
 add_executable(unit_tests
     unit/json_test.cpp
     unit/sha256_test.cpp
+    unit/signature_test.cpp
     unit/manifest_test.cpp
     unit/safetensors_test.cpp
     unit/tokenizer_fixture.cpp
@@ -13,6 +14,7 @@ add_executable(unit_tests
     unit/stop_test.cpp
     unit/qwen_model_test.cpp
     golden/golden_test.cpp
+    unit/artifact_loader_test.cpp
     unit/scheduler_test.cpp
     unit/event_channel_test.cpp
     testutil/tiny_model.cpp
