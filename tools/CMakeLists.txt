@@ -10,6 +10,10 @@ if(LYKURO_ENABLE_CUDA)
     target_compile_definitions(bench_decode PRIVATE LYKURO_HAVE_CUDA)
     target_link_libraries(bench_decode PRIVATE lykuro_backend_cuda)
 endif()
+if(LYKURO_ENABLE_METAL)
+    target_compile_definitions(bench_decode PRIVATE LYKURO_HAVE_METAL)
+    target_link_libraries(bench_decode PRIVATE lykuro_backend_metal)
+endif()
 
 add_executable(soak_engine soak_engine.cpp)
 target_link_libraries(soak_engine

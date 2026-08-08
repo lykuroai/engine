@@ -55,6 +55,12 @@ private:
     struct Impl;
     Status ForwardToken(uint32_t token, uint32_t pos, void* sequence_state,
                         std::vector<float>& logits_out, bool want_logits);
+    // Multi-token prefill chunk (fixed size kPrefillChunk; the tail is
+    // handled as an overlapping chunk so the last real token always sits
+    // in the final row).
+    Status ForwardChunk(const uint32_t* tokens, uint32_t pos0,
+                        void* sequence_state,
+                        std::vector<float>& logits_out, bool want_logits);
 
     QwenConfig config_;
     ModelLimits limits_;

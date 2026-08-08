@@ -98,12 +98,27 @@ admission(working set × (1−15%) budget との fail-closed 照合、§10)、
 macOS ネイティブ production 形態(signed artifact + mTLS + Metal +
 metrics + graceful shutdown)での `native-engine` 起動確認。
 
+**Phase 4(性能)第一弾完了**(Apple M4 Pro、Qwen2.5-0.5B、FP32):
+feeds 辞書の per-token 構築を排除(常駐 shared MTLBuffer 直書き +
+bucket 別キャッシュ)、resultsDictionary で staging buffer へ直接出力
+(readBytes×49 排除)、multi-token prefill graph(P=32、末尾は
+overlap chunk で logits 行を固定)、load 時 graph pre-warm。
+
+| 指標 | 最適化前 | 最適化後 |
+|---|---:|---:|
+| decode(短 ctx) | 72 tok/s | **87 tok/s** |
+| TTFT(39 tok prompt) | 1330 ms | **43 ms** |
+| prefill 実効(329 tok) | ~24 ms/tok | **~153 tok/s** |
+
+decode は ctx bucket 拡大で逓減(bucket256 で ~48 tok/s)。
+計測知見: 「chunked prefill 後の decode 劣化」に見えた現象は decode
+graph 初回コンパイルの計上位置の差であり、pre-warm で解消。
+
 Metal 未実装項目: FP16 化(operator 別 tolerance 定義とセット)、
 watermark 段階制御(warning/critical、§10.4)、custom Metal Kernel
-(本開発機に metal compiler 無し — 事前 compile 済み metallib は
-Xcode を持つ CI が必要)、launchd/pkg/Developer ID 署名/notarization
-(Phase 3 — 環境なし)、Metal 追加 error code の proto 反映、
-性能最適化(逐次 PoC のため低速 — Phase 4)。
+(本開発機に metal compiler 無し)、launchd/pkg/Developer ID 署名/
+notarization(Phase 3 — 環境なし)、Metal error code の proto 反映、
+decode の bucket 逓減対策・batched decode(Phase 4 続き)。
 
 ## 未実装・未検証(spec §35 に基づく明示)
 

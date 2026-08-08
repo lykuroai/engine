@@ -15,6 +15,9 @@
 #ifdef LYKURO_HAVE_CUDA
 #include "backends/cuda/qwen_cuda_model.h"
 #endif
+#ifdef LYKURO_HAVE_METAL
+#include "backends/metal/qwen_metal_model.h"
+#endif
 
 using namespace lykuro::nie;
 
@@ -61,7 +64,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::unique_ptr<GenerativeModel> model = std::move(loaded.artifact.model);
-    if (backend.rfind("cuda", 0) == 0) {
+    if (backend == "metal") {
+#ifdef LYKURO_HAVE_METAL
+        auto metal = QwenMetalModel::Load(loaded.artifact.manifest,
+                                          *loaded.artifact.weights);
+        if (!metal.status.ok()) {
+            std::fprintf(stderr, "metal load failed: %s\n",
+                         metal.status.message().c_str());
+            return 1;
+        }
+        model = std::move(metal.model);
+#else
+        std::fprintf(stderr, "no Metal in this build\n");
+        return 1;
+#endif
+    } else if (backend.rfind("cuda", 0) == 0) {
 #ifdef LYKURO_HAVE_CUDA
         CudaModelOptions cuda_options;
         if (!ParseCudaBackend(backend, cuda_options)) {
