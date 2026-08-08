@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon for the Lykuro Native Inference Engine (macOS arm64).
+  LYK-NIE-ADD-METAL-001 §23.3 (system service) / §24.
+
+  Installed to /Library/LaunchDaemons/ by the signed package. Runs as a
+  dedicated non-root service user with the engine binary and config from
+  /Library/Application Support/Lykuro/NativeEngine. The engine binds
+  loopback/host-only per its config; this file grants no network scope of
+  its own. No sudo is assumed at runtime.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.lykuro.native-engine</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/Lykuro/NativeEngine/bin/lykuro-native-engine</string>
+        <string>--config</string>
+        <string>/Library/Application Support/Lykuro/NativeEngine/config/engine.yaml</string>
+    </array>
+
+    <!-- Dedicated service identity (created by the installer, non-root). -->
+    <key>UserName</key>
+    <string>_lykuro</string>
+    <key>GroupName</key>
+    <string>_lykuro</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <!-- Backoff so a crash-looping load does not hammer the GPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <!-- Content-free logs only (spec §22.4); the engine itself never
+         writes prompt/response. -->
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Lykuro/NativeEngine/engine.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Lykuro/NativeEngine/engine.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/Lykuro/NativeEngine</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+</dict>
+</plist>

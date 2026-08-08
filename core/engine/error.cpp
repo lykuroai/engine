@@ -24,6 +24,23 @@ std::string_view ErrorCodeName(ErrorCode code) {
         case ErrorCode::kInferenceFailed: return "inference_failed";
         case ErrorCode::kStreamConsumerSlow: return "stream_consumer_slow";
         case ErrorCode::kInternalError: return "internal_error";
+        case ErrorCode::kMetalBackendUnavailable:
+            return "metal_backend_unavailable";
+        case ErrorCode::kMetalDeviceUnsupported:
+            return "metal_device_unsupported";
+        case ErrorCode::kMetalLibraryInvalid:
+            return "metal_library_invalid";
+        case ErrorCode::kMetalPipelineCreationFailed:
+            return "metal_pipeline_creation_failed";
+        case ErrorCode::kMetalCommandFailed: return "metal_command_failed";
+        case ErrorCode::kMetalMemoryPressure:
+            return "metal_memory_pressure";
+        case ErrorCode::kMetalOutOfMemory: return "metal_out_of_memory";
+        case ErrorCode::kMetalExecutionTimeout:
+            return "metal_execution_timeout";
+        case ErrorCode::kMacProfileNotCertified:
+            return "mac_profile_not_certified";
+        case ErrorCode::kBackendAbiMismatch: return "backend_abi_mismatch";
     }
     return "internal_error";
 }
@@ -38,6 +55,7 @@ bool IsRetryable(ErrorCode code) {
         case ErrorCode::kCapacityExhausted:
         case ErrorCode::kEngineDraining:
         case ErrorCode::kGpuUnhealthy:
+        case ErrorCode::kMetalMemoryPressure:  // §21: retryable
             return true;
         default:
             return false;

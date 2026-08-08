@@ -9,11 +9,11 @@ Status InspectMetalDevice(MetalDeviceInfo& out) {
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (device == nil) {
-            return Status(ErrorCode::kGpuUnhealthy,
+            return Status(ErrorCode::kMetalBackendUnavailable,
                           "metal device unavailable", "metal_backend");
         }
         if (!device.hasUnifiedMemory) {
-            return Status(ErrorCode::kUnsupportedModel,
+            return Status(ErrorCode::kMetalDeviceUnsupported,
                           "device lacks unified memory", "metal_backend");
         }
         out.device_name = device.name.UTF8String;

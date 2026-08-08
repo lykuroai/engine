@@ -5,6 +5,7 @@ add_executable(unit_tests
     unit/json_test.cpp
     unit/sha256_test.cpp
     unit/signature_test.cpp
+    unit/error_test.cpp
     unit/manifest_test.cpp
     unit/safetensors_test.cpp
     unit/tokenizer_fixture.cpp

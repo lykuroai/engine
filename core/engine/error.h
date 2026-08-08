@@ -28,6 +28,18 @@ enum class ErrorCode : int32_t {
     kInferenceFailed,
     kStreamConsumerSlow,
     kInternalError,
+    // Metal backend codes (LYK-NIE-ADD-METAL-001 §21). Appended so the
+    // existing wire values are unchanged.
+    kMetalBackendUnavailable,
+    kMetalDeviceUnsupported,
+    kMetalLibraryInvalid,
+    kMetalPipelineCreationFailed,
+    kMetalCommandFailed,
+    kMetalMemoryPressure,
+    kMetalOutOfMemory,
+    kMetalExecutionTimeout,
+    kMacProfileNotCertified,
+    kBackendAbiMismatch,
 };
 
 std::string_view ErrorCodeName(ErrorCode code);

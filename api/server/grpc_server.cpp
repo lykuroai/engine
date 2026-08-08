@@ -53,6 +53,26 @@ pb::ErrorCode ToProtoCode(ErrorCode code) {
         case ErrorCode::kStreamConsumerSlow:
             return pb::ERROR_CODE_STREAM_CONSUMER_SLOW;
         case ErrorCode::kInternalError: return pb::ERROR_CODE_INTERNAL_ERROR;
+        case ErrorCode::kMetalBackendUnavailable:
+            return pb::ERROR_CODE_METAL_BACKEND_UNAVAILABLE;
+        case ErrorCode::kMetalDeviceUnsupported:
+            return pb::ERROR_CODE_METAL_DEVICE_UNSUPPORTED;
+        case ErrorCode::kMetalLibraryInvalid:
+            return pb::ERROR_CODE_METAL_LIBRARY_INVALID;
+        case ErrorCode::kMetalPipelineCreationFailed:
+            return pb::ERROR_CODE_METAL_PIPELINE_CREATION_FAILED;
+        case ErrorCode::kMetalCommandFailed:
+            return pb::ERROR_CODE_METAL_COMMAND_FAILED;
+        case ErrorCode::kMetalMemoryPressure:
+            return pb::ERROR_CODE_METAL_MEMORY_PRESSURE;
+        case ErrorCode::kMetalOutOfMemory:
+            return pb::ERROR_CODE_METAL_OUT_OF_MEMORY;
+        case ErrorCode::kMetalExecutionTimeout:
+            return pb::ERROR_CODE_METAL_EXECUTION_TIMEOUT;
+        case ErrorCode::kMacProfileNotCertified:
+            return pb::ERROR_CODE_MAC_PROFILE_NOT_CERTIFIED;
+        case ErrorCode::kBackendAbiMismatch:
+            return pb::ERROR_CODE_BACKEND_ABI_MISMATCH;
     }
     return pb::ERROR_CODE_INTERNAL_ERROR;
 }

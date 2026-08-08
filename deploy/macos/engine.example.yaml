@@ -1,0 +1,51 @@
+# Lykuro Native Inference Engine — macOS Metal example config
+# (LYK-NIE-ADD-METAL-001 §20). Values are examples, not certified
+# defaults; fix them from an on-device benchmark before production.
+#
+# NOTE: the current config loader is JSON (core/engine/config.*). This
+# YAML mirrors the spec's shape; the installer converts it, or run the
+# engine with the equivalent engine.json until YAML parsing lands.
+
+engine:
+  id: nie-mac-node-01
+  listen_address: 127.0.0.1     # loopback / host-only (spec §22.1)
+  grpc_port: 19443
+  log_level: info
+
+security:
+  mtls_required: true
+  # Secret material by file reference only (spec §20.2). Paths point at
+  # the secret mount the installer configures; never inline secrets here.
+  server_cert_path: /Library/Application Support/Lykuro/NativeEngine/secrets/server.crt
+  server_key_path: /Library/Application Support/Lykuro/NativeEngine/secrets/server.key
+  client_ca_path: /Library/Application Support/Lykuro/NativeEngine/secrets/client-ca.crt
+  control_identities: [lykuro-model-manager]   # Control API is Manager-only
+  data_identities: [lykuro-model-manager, lykuro-gateway]
+  trusted_signing_keys: []      # Ed25519 pubkey hex; required in production
+
+model:
+  artifact_path: /Library/Application Support/Lykuro/Models/current
+
+hardware:
+  backend: metal
+  device_id: 0                  # system default device
+
+# metal-specific tuning (spec §20.1). Not yet all wired into the loader;
+# documented here so operators and the installer share one shape.
+# metal:
+#   execution_mode: metal_native
+#   precision: fp16
+#   safety_margin_percent: 15
+#   warning_watermark_percent: 80
+#   critical_watermark_percent: 90
+
+scheduler:
+  max_queue: 64
+  max_sequences: 1              # raise after golden/soak validation
+
+generation:
+  max_output_tokens: 4096
+
+observability:
+  metrics_enabled: true
+  metrics_port: 19090
