@@ -241,35 +241,61 @@ public:
                          std::unique_ptr<MetalSequenceState>& out) {
         auto state =
             std::unique_ptr<MetalSequenceState>(new MetalSequenceState());
+        state->device_ = device;
         state->esz_ = esz;
         state->dt_ = dt;
         state->kv_stride_ = config.num_kv_heads * config.head_dim;
         state->max_tokens_ = max_tokens;
-        // Rounded up so a [bucket, kv] view never exceeds the buffer.
-        const uint32_t alloc_tokens =
-            ((max_tokens + kCtxBucket - 1) / kCtxBucket) * kCtxBucket;
-        const size_t bytes =
-            size_t(alloc_tokens) * state->kv_stride_ * esz;
         state->keys_.resize(config.num_layers);
         state->values_.resize(config.num_layers);
-        for (uint32_t l = 0; l < config.num_layers; ++l) {
-            id<MTLBuffer> k =
-                [device newBufferWithLength:bytes
-                                    options:MTLResourceStorageModeShared];
-            id<MTLBuffer> v =
-                [device newBufferWithLength:bytes
-                                    options:MTLResourceStorageModeShared];
-            if (k == nil || v == nil) {
+        // Lazy allocation: start small and grow on demand. The logical
+        // capacity is max_tokens, but a short request only ever backs a
+        // few blocks of physical KV (avoids ~800MB/sequence at 32k
+        // context — the MVP contiguous equivalent of paged KV).
+        const uint32_t initial =
+            std::min<uint32_t>(max_tokens, 2 * kCtxBucket);
+        Status s = state->Reserve(initial);
+        if (!s.ok()) return s;
+        out = std::move(state);
+        return Status::Ok();
+    }
+
+    // Ensures physical capacity for at least `tokens` positions, rounded
+    // up to a context bucket. Growth copies existing KV forward and
+    // invalidates the TensorData view cache (buffer pointers change).
+    Status Reserve(uint32_t tokens) {
+        const uint32_t want =
+            ((tokens + kCtxBucket - 1) / kCtxBucket) * kCtxBucket;
+        if (want <= alloc_tokens_) return Status::Ok();
+        uint32_t grown = alloc_tokens_ == 0 ? want : alloc_tokens_;
+        while (grown < want) grown *= 2;
+        grown = std::min(grown,
+                         ((max_tokens_ + kCtxBucket - 1) / kCtxBucket) *
+                             kCtxBucket);
+        const size_t new_bytes = size_t(grown) * kv_stride_ * esz_;
+        const size_t old_bytes = size_t(alloc_tokens_) * kv_stride_ * esz_;
+        for (uint32_t l = 0; l < keys_.size(); ++l) {
+            id<MTLBuffer> nk =
+                [device_ newBufferWithLength:new_bytes
+                                     options:MTLResourceStorageModeShared];
+            id<MTLBuffer> nv =
+                [device_ newBufferWithLength:new_bytes
+                                     options:MTLResourceStorageModeShared];
+            if (nk == nil || nv == nil) {
                 return Status(ErrorCode::kGpuOom,
                               "kv cache allocation failed", kComponent);
             }
-            // Zeroed so masked padding rows can never inject NaN/Inf.
-            std::memset(k.contents, 0, bytes);
-            std::memset(v.contents, 0, bytes);
-            state->keys_[l] = k;
-            state->values_[l] = v;
+            std::memset(nk.contents, 0, new_bytes);
+            std::memset(nv.contents, 0, new_bytes);
+            if (keys_[l] != nil && old_bytes > 0) {
+                std::memcpy(nk.contents, keys_[l].contents, old_bytes);
+                std::memcpy(nv.contents, values_[l].contents, old_bytes);
+            }
+            keys_[l] = nk;
+            values_[l] = nv;
         }
-        out = std::move(state);
+        alloc_tokens_ = grown;
+        kv_td_cache_.clear();  // views point at the old buffers
         return Status::Ok();
     }
 
@@ -315,8 +341,10 @@ public:
 
 private:
     MetalSequenceState() = default;
+    id<MTLDevice> device_ = nil;
     uint32_t kv_stride_ = 0;
-    uint32_t max_tokens_ = 0;
+    uint32_t max_tokens_ = 0;    // logical capacity
+    uint32_t alloc_tokens_ = 0;  // physical capacity (grows on demand)
     uint32_t length_ = 0;
     std::vector<id<MTLBuffer>> keys_;
     std::vector<id<MTLBuffer>> values_;
@@ -672,6 +700,10 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
         const uint32_t kv_dim = c.num_kv_heads * c.head_dim;
         const uint32_t bucket =
             ((pos / kCtxBucket) + 1) * kCtxBucket;  // cached rows fed
+
+        // Grow physical KV to cover this bucket before it is viewed.
+        Status reserve = state.Reserve(bucket);
+        if (!reserve.ok()) return reserve;
 
         // Build (or reuse) the bucket-specialized graph.
         Impl::BucketGraph& bg = impl.bucket_graphs[bucket];
@@ -1069,6 +1101,10 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
             kCtxBucket,
             ((pos0 + kCtxBucket - 1) / kCtxBucket) * kCtxBucket);
         const uint32_t rows = bucket + P;
+
+        // Grow physical KV to cover the chunk's writes (pos0 + P).
+        Status reserve = state.Reserve(pos0 + P);
+        if (!reserve.ok()) return reserve;
 
         Impl::PrefillGraph& pg = impl.prefill_graphs[bucket];
         if (pg.graph == nil) {
