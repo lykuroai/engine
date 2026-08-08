@@ -75,6 +75,28 @@ artifact 化し、HF transformers FP32 を oracle として照合
 は無効化。本 Engine は仕様 §18.1 どおり MVP では repetition penalty
 非対応)。
 
+## Metal Backend(LYK-NIE-ADD-METAL-001、Phase 0-1 完了)
+
+Apple Silicon 向け MPSGraph backend(`backends/metal/`、
+`LYKURO_ENABLE_METAL=ON`)。既存 `GenerativeModel` 境界への追加で
+Core/API は無変更(§5.1)。実機 **Apple M4 Pro / 64GB Unified Memory**
+(仕様の主検証プロファイル)で検証:
+
+- Phase 0: As-Built 報告(`docs/metal/as-built-report.md`)+ MPSGraph
+  1 operator 実機実行
+- Phase 1: FP32 compute の correctness PoC — tiny model CPU parity
+  (1e-3、greedy 20 step 一致、決定性)、**実 Qwen2.5-0.5B の oracle
+  3/3 完全一致(logits ≤5e-5、greedy 96/96)**
+- 構成: weights は unified memory の MTLBuffer を placeholder 直結
+  (コピー無し)、context bucket(128)別に graph をキャッシュ、
+  RoPE cos/sin は host 供給、KV は bounded contiguous(§16 MVP)
+
+Metal 未実装項目: FP16 化(operator 別 tolerance 定義とセット)、
+engine/serving 統合、custom Metal Kernel(本開発機に metal compiler
+無し — 事前 compile 済み metallib は Xcode を持つ CI が必要)、
+Unified Memory budget/watermark admission、launchd/pkg/署名/
+notarization(Phase 3)、Metal 追加 error code の proto 反映。
+
 ## 未実装・未検証(spec §35 に基づく明示)
 
 - **certified profile の正式発行**: Phase 4 最適化(bf16 weight 常駐 +

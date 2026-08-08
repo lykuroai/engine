@@ -42,6 +42,18 @@ if(LYKURO_ENABLE_CUDA)
     gtest_discover_tests(cuda_tests)
 endif()
 
+if(LYKURO_ENABLE_METAL)
+    add_executable(metal_tests
+        metal/metal_parity_test.cpp
+        testutil/tiny_model.cpp
+    )
+    target_link_libraries(metal_tests
+        PRIVATE lykuro_backend_metal lykuro_model lykuro_core
+                lykuro_security lykuro_backend_cpu lykuro_options
+                GTest::gtest GTest::gtest_main)
+    gtest_discover_tests(metal_tests)
+endif()
+
 if(LYKURO_ENABLE_GRPC)
     add_executable(grpc_tests
         integration/grpc_server_test.cpp

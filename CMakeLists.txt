@@ -13,6 +13,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(LYKURO_ENABLE_CUDA "Build the CUDA backend" OFF)
 option(LYKURO_ENABLE_GRPC "Build the gRPC API server" OFF)
+option(LYKURO_ENABLE_METAL "Build the Apple Metal backend (macOS arm64)" OFF)
 option(LYKURO_BUILD_TESTS "Build tests" ON)
 option(LYKURO_ENABLE_SANITIZERS "Enable ASan/UBSan in Debug builds" ON)
 
