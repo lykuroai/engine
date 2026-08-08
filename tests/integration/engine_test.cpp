@@ -289,6 +289,22 @@ TEST_F(EngineTest, StopSequenceEndsGenerationWithoutLeaking) {
     EXPECT_LT(events.back().usage.output_tokens, 50u);
 }
 
+// After a request finishes, all per-request bookkeeping is dropped so the
+// engine's maps stay bounded by in-flight work (24h-soak safety). A
+// completed id is reusable and a late cancel is a no-op.
+TEST_F(EngineTest, TerminalRequestsAreForgotten) {
+    auto engine = MakeEngine({});
+    for (int i = 0; i < 50; ++i) {
+        auto submit = engine->Submit(MakeRequest("reused_id", 3));
+        ASSERT_TRUE(submit.status.ok()) << "iteration " << i;
+        engine->RunUntilIdle();
+        auto events = Drain(*submit.events);
+        EXPECT_EQ(events.back().kind, StreamEvent::Kind::kCompleted);
+    }
+    // Late cancel of a long-finished id is a no-op (not "found").
+    EXPECT_FALSE(engine->Cancel("reused_id"));
+}
+
 TEST_F(EngineTest, DuplicateRequestIdRejected) {
     auto engine = MakeEngine({});
     ASSERT_TRUE(engine->Submit(MakeRequest("req_dup", 3)).status.ok());

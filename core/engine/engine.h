@@ -126,6 +126,10 @@ private:
     void DecodeIteration(int64_t now);
     void SetState(const std::string& request_id, RequestState state);
     bool IsCancelled(const std::string& request_id) const;
+    // Drops all per-request bookkeeping once a request reaches a terminal
+    // state, so the maps stay bounded by in-flight work (not lifetime
+    // request count). Caller holds state_mutex_.
+    void ForgetLocked(const std::string& request_id);
 
     std::unique_ptr<GenerativeModel> model_;
     std::unique_ptr<BpeTokenizer> tokenizer_;

@@ -75,6 +75,13 @@ bool InferenceEngine::IsCancelled(const std::string& request_id) const {
     return it != cancel_flags_.end() && it->second;
 }
 
+void InferenceEngine::ForgetLocked(const std::string& request_id) {
+    registry_.erase(request_id);
+    cancel_flags_.erase(request_id);
+    channels_.erase(request_id);
+    slow_consumers_.erase(request_id);
+}
+
 InferenceEngine::SubmitResult InferenceEngine::Submit(
     const InferenceRequest& request) {
     if (m_received_ != nullptr) m_received_->Increment();
@@ -185,12 +192,9 @@ bool InferenceEngine::Cancel(const std::string& request_id) {
         std::shared_ptr<EventChannel> channel;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            registry_[request_id] = RequestState::kCancelled;
             auto ch = channels_.find(request_id);
-            if (ch != channels_.end()) {
-                channel = ch->second;
-                channels_.erase(ch);
-            }
+            if (ch != channels_.end()) channel = ch->second;
+            ForgetLocked(request_id);
         }
         if (channel) {
             StreamEvent e;
@@ -273,10 +277,7 @@ void InferenceEngine::FinishSequence(size_t index, FinishReason reason) {
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        registry_[request_id] = reason == FinishReason::kCancelled
-                                    ? RequestState::kCancelled
-                                    : RequestState::kCompleted;
-        channels_.erase(request_id);
+        ForgetLocked(request_id);
     }
     if (reason == FinishReason::kCancelled) {
         if (m_cancelled_ != nullptr) m_cancelled_->Increment();
@@ -305,8 +306,7 @@ void InferenceEngine::FailSequence(size_t index, Status status) {
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        registry_[request_id] = RequestState::kFailed;
-        channels_.erase(request_id);
+        ForgetLocked(request_id);
     }
     if (m_failed_ != nullptr) m_failed_->Increment();
     active_.erase(active_.begin() + long(index));
@@ -317,12 +317,9 @@ void InferenceEngine::RejectExpired(int64_t now) {
         std::shared_ptr<EventChannel> channel;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            registry_[expired->request_id] = RequestState::kFailed;
             auto ch = channels_.find(expired->request_id);
-            if (ch != channels_.end()) {
-                channel = ch->second;
-                channels_.erase(ch);
-            }
+            if (ch != channels_.end()) channel = ch->second;
+            ForgetLocked(expired->request_id);
         }
         if (channel) {
             StreamEvent e;
@@ -367,8 +364,7 @@ void InferenceEngine::AdmitPending(int64_t now) {
             channel->TryPush(std::move(e));
             channel->Close();
             std::lock_guard<std::mutex> lock(state_mutex_);
-            registry_[request_id] = RequestState::kCancelled;
-            channels_.erase(request_id);
+            ForgetLocked(request_id);
             continue;
         }
 
