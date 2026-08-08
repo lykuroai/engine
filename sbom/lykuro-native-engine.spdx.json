@@ -1,0 +1,107 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "lykuro-native-inference-engine",
+  "documentNamespace": "https://lykuro.ai/spdx/native-engine/1.0.0",
+  "creationInfo": {
+    "created": "2026-08-08T00:00:00Z",
+    "creators": ["Organization: Lykuro.ai", "Tool: lykuro-sbom-gen"],
+    "comment": "Dependency inventory for the Lykuro Native Inference Engine. The engine implements its own JSON parser, SHA-256, safetensors reader, BPE tokenizer, and all inference kernels; no third-party inference runtime (Ollama/llama.cpp/vLLM/TGI/mlx-lm) is vendored, linked, or present as a transitive dependency (spec §0.2, AT-01/AT-M03). Two build profiles: Linux+CUDA and macOS+Metal."
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-lykuro-native-engine",
+      "name": "lykuro-native-engine",
+      "versionInfo": "1.0.0",
+      "supplier": "Organization: Lykuro.ai",
+      "downloadLocation": "https://github.com/lykuroai/engine",
+      "licenseConcluded": "LicenseRef-Lykuro-Proprietary",
+      "licenseDeclared": "LicenseRef-Lykuro-Proprietary",
+      "copyrightText": "Copyright (c) 2026 Lykuro.ai / e-Business Solutions Inc.",
+      "filesAnalyzed": false,
+      "comment": "First-party engine (core, scheduler, KV, model plugin, backends, API, security)."
+    },
+    {
+      "SPDXID": "SPDXRef-Package-cuda-toolkit",
+      "name": "CUDA Toolkit (cudart)",
+      "versionInfo": "12.8",
+      "supplier": "Organization: NVIDIA",
+      "downloadLocation": "https://developer.nvidia.com/cuda-toolkit",
+      "licenseConcluded": "LicenseRef-NVIDIA-CUDA-EULA",
+      "licenseDeclared": "LicenseRef-NVIDIA-CUDA-EULA",
+      "copyrightText": "Copyright (c) NVIDIA Corporation",
+      "filesAnalyzed": false,
+      "comment": "Linux profile only. Approved low-level GPU SDK (spec §0.2). Runtime link: CUDA::cudart. cuBLAS was removed in Phase 4 (custom kernels)."
+    },
+    {
+      "SPDXID": "SPDXRef-Package-grpc",
+      "name": "gRPC (grpc++)",
+      "versionInfo": "1.66.2",
+      "supplier": "Organization: gRPC authors / CNCF",
+      "downloadLocation": "https://github.com/grpc/grpc",
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright The gRPC Authors",
+      "filesAnalyzed": false,
+      "comment": "Internal API transport (mTLS). Built from source against the system OpenSSL. Optional (LYKURO_ENABLE_GRPC)."
+    },
+    {
+      "SPDXID": "SPDXRef-Package-protobuf",
+      "name": "Protocol Buffers (libprotobuf)",
+      "versionInfo": "27.2 (Linux) / 35.1 (macOS)",
+      "supplier": "Organization: Google",
+      "downloadLocation": "https://github.com/protocolbuffers/protobuf",
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "Copyright Google LLC",
+      "filesAnalyzed": false,
+      "comment": "API contract encoding. Version pinned per build host; release build fixes one version."
+    },
+    {
+      "SPDXID": "SPDXRef-Package-openssl",
+      "name": "OpenSSL (libcrypto)",
+      "versionInfo": "3.0.2 (Linux) / 3.6.3 (macOS)",
+      "supplier": "Organization: OpenSSL Project",
+      "downloadLocation": "https://www.openssl.org",
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright The OpenSSL Project Authors",
+      "filesAnalyzed": false,
+      "comment": "Ed25519 manifest signature verification (security/signature). System OpenSSL."
+    },
+    {
+      "SPDXID": "SPDXRef-Package-apple-metal",
+      "name": "Apple Metal / MetalPerformanceShaders / MPSGraph",
+      "versionInfo": "macOS 26.5.2 SDK",
+      "supplier": "Organization: Apple",
+      "downloadLocation": "https://developer.apple.com/metal",
+      "licenseConcluded": "LicenseRef-Apple-SDK",
+      "licenseDeclared": "LicenseRef-Apple-SDK",
+      "copyrightText": "Copyright Apple Inc.",
+      "filesAnalyzed": false,
+      "comment": "macOS profile only. System frameworks (Foundation, Metal, MetalPerformanceShaders, MetalPerformanceShadersGraph)."
+    },
+    {
+      "SPDXID": "SPDXRef-Package-googletest",
+      "name": "GoogleTest",
+      "versionInfo": "1.17.0 (macOS) / 1.10.0 (Linux)",
+      "supplier": "Organization: Google",
+      "downloadLocation": "https://github.com/google/googletest",
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "Copyright Google LLC",
+      "filesAnalyzed": false,
+      "comment": "TEST/DEV ONLY. Never linked into a production artifact (not present in release packages)."
+    }
+  ],
+  "relationships": [
+    { "spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-Package-lykuro-native-engine" },
+    { "spdxElementId": "SPDXRef-Package-lykuro-native-engine", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Package-cuda-toolkit" },
+    { "spdxElementId": "SPDXRef-Package-lykuro-native-engine", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Package-grpc" },
+    { "spdxElementId": "SPDXRef-Package-lykuro-native-engine", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Package-protobuf" },
+    { "spdxElementId": "SPDXRef-Package-lykuro-native-engine", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Package-openssl" },
+    { "spdxElementId": "SPDXRef-Package-lykuro-native-engine", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Package-apple-metal" },
+    { "spdxElementId": "SPDXRef-Package-lykuro-native-engine", "relationshipType": "DEV_DEPENDENCY_OF", "relatedSpdxElement": "SPDXRef-Package-googletest" }
+  ]
+}
