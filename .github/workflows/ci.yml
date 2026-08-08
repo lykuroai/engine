@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # Standard hosted runner: core + unit + integration (no GPU), plus the
+  # policy gates. This is the always-on gate for every push/PR (§30.2).
+  core:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Forbidden-runtime gate (spec §0.2, AT-01/AT-M03)
+        run: ./tools/check_no_forbidden_runtime.sh
+
+      - name: Validate SBOM is present and well-formed
+        run: |
+          python3 -c "import json,sys; json.load(open('sbom/lykuro-native-engine.spdx.json'))"
+          test -f licenses/THIRD_PARTY_NOTICES.md
+          test -f licenses/Apache-2.0.txt
+          test -f licenses/BSD-3-Clause.txt
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake libgtest-dev libssl-dev
+
+      - name: Configure (CPU-only, no GPU/gRPC)
+        run: cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/ci -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build/ci --output-on-failure
+
+  # CUDA integration/golden/parity + soak. Self-hosted GPU runner; manual
+  # only so it never blocks a PR and never contends with a running soak.
+  cuda:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CUDA + gRPC)
+        run: >
+          cmake -S . -B build/cuda -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DLYKURO_ENABLE_CUDA=ON -DLYKURO_ENABLE_GRPC=ON
+          -DCMAKE_PREFIX_PATH="$HOME/.local/grpc"
+      - name: Build
+        run: cmake --build build/cuda -j
+      - name: Test (GPU 0)
+        env:
+          LYKURO_TEST_DEVICE: "0"
+        run: ctest --test-dir build/cuda --output-on-failure
+
+  # Metal integration/golden + real-model oracle. Self-hosted Apple
+  # Silicon runner; manual only.
+  metal:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Metal + gRPC)
+        run: >
+          cmake -S . -B build/metal -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DLYKURO_ENABLE_METAL=ON -DLYKURO_ENABLE_GRPC=ON
+      - name: Build
+        run: cmake --build build/metal -j
+      - name: Test
+        run: ctest --test-dir build/metal --output-on-failure
