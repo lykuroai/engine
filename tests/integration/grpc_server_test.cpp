@@ -395,6 +395,38 @@ TEST_F(GrpcServerTest, CudaBackendRejectsBadDevice) {
 }
 #endif  // LYKURO_HAVE_CUDA
 
+#ifdef LYKURO_HAVE_METAL
+// Metal serving e2e (addendum Phase 2): the full gRPC path on the Apple
+// GPU must match CPU-served output.
+TEST_F(GrpcServerTest, MetalBackendServesIdenticalOutput) {
+    auto serve_once = [&](const std::string& backend) {
+        ServerConfig config;
+        config.credentials = grpc::InsecureServerCredentials();
+        config.load_options.allow_unsigned_dev = true;
+        config.hardware_backend = backend;
+        EngineServer server(config);
+        int port = 0;
+        EXPECT_TRUE(server.Start(&port).ok());
+        EXPECT_TRUE(server.LoadModel(artifact_dir_.string()).ok());
+        auto channel =
+            grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                grpc::InsecureChannelCredentials());
+        auto stub = pb::DataService::NewStub(channel);
+        grpc::ClientContext ctx;
+        pb::GenerateRequest req = MakeGenerateRequest("req_" + backend);
+        req.mutable_generation()->set_max_output_tokens(12);
+        pb::GenerateResponse response;
+        EXPECT_TRUE(stub->Generate(&ctx, req, &response).ok());
+        server.Shutdown();
+        return response.output_text();
+    };
+    std::string cpu_text = serve_once("cpu");
+    std::string metal_text = serve_once("metal");
+    EXPECT_EQ(cpu_text, metal_text);
+    EXPECT_FALSE(metal_text.empty());
+}
+#endif  // LYKURO_HAVE_METAL
+
 TEST_F(GrpcServerTest, UnloadThenReloadWorks) {
     pb::LoadModelResponse load;
     ASSERT_TRUE(LoadViaControl(&load).ok());

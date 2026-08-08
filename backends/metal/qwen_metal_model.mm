@@ -211,6 +211,40 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
         impl.graph_device =
             [MPSGraphDevice deviceWithMTLDevice:impl.device];
 
+        // Unified Memory admission (addendum §10): the FP32 weight
+        // estimate must fit inside the engine budget derived from the
+        // recommended working set, never the physical total. Fail closed
+        // before any allocation.
+        {
+            const double safety_margin = 0.15;
+            const uint64_t budget = uint64_t(
+                double(impl.device.recommendedMaxWorkingSetSize) *
+                (1.0 - safety_margin));
+            // FP32 resident weights: embed + per-layer projections
+            // (+ transposed head copy when tied).
+            const uint64_t h64 = c.hidden_size;
+            const uint64_t per_layer =
+                (2 * h64 +                                   // norms
+                 h64 * size_t(c.num_heads) * c.head_dim +    // q
+                 2 * h64 * size_t(c.num_kv_heads) * c.head_dim +  // k,v
+                 size_t(c.num_heads) * c.head_dim * h64 +    // o
+                 3 * h64 * uint64_t(c.intermediate_size)) *  // mlp
+                sizeof(float);
+            const uint64_t weight_bytes =
+                uint64_t(c.vocab_size) * h64 * sizeof(float) * 2 +
+                uint64_t(c.num_layers) * per_layer;
+            if (weight_bytes > budget) {
+                result.status =
+                    Status(ErrorCode::kCapacityExhausted,
+                           "model exceeds unified memory budget",
+                           kComponent)
+                        .WithDetail("budget_bytes", int64_t(budget))
+                        .WithDetail("weight_bytes",
+                                    int64_t(weight_bytes));
+                return result;
+            }
+        }
+
         const size_t h = c.hidden_size;
         const size_t q_dim = size_t(c.num_heads) * c.head_dim;
         const size_t kv_dim = size_t(c.num_kv_heads) * c.head_dim;

@@ -10,6 +10,9 @@
 #ifdef LYKURO_HAVE_CUDA
 #include "backends/cuda/qwen_cuda_model.h"
 #endif
+#ifdef LYKURO_HAVE_METAL
+#include "backends/metal/qwen_metal_model.h"
+#endif
 
 namespace lykuro::nie {
 
@@ -629,6 +632,16 @@ Status EngineServer::LoadModel(const std::string& artifact_dir) {
 #else
         return Status(ErrorCode::kUnsupportedModel,
                       "this build has no CUDA backend", "control");
+#endif
+    } else if (config_.hardware_backend == "metal") {
+#ifdef LYKURO_HAVE_METAL
+        auto metal = QwenMetalModel::Load(loaded.artifact.manifest,
+                                          *loaded.artifact.weights);
+        if (!metal.status.ok()) return metal.status;
+        serving_model = std::move(metal.model);
+#else
+        return Status(ErrorCode::kUnsupportedModel,
+                      "this build has no Metal backend", "control");
 #endif
     } else if (config_.hardware_backend != "cpu") {
         return Status(ErrorCode::kInvalidRequest,

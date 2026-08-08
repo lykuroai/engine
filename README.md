@@ -91,11 +91,19 @@ Core/API は無変更(§5.1)。実機 **Apple M4 Pro / 64GB Unified Memory**
   (コピー無し)、context bucket(128)別に graph をキャッシュ、
   RoPE cos/sin は host 供給、KV は bounded contiguous(§16 MVP)
 
+**Phase 2(engine/serving 統合)完了**: `hardware.backend: metal` で
+gRPC serving(CPU serving と出力一致を e2e テストで確認)、engine の
+streaming/cancel/deadline を Metal 上で検証、load 前の Unified Memory
+admission(working set × (1−15%) budget との fail-closed 照合、§10)、
+macOS ネイティブ production 形態(signed artifact + mTLS + Metal +
+metrics + graceful shutdown)での `native-engine` 起動確認。
+
 Metal 未実装項目: FP16 化(operator 別 tolerance 定義とセット)、
-engine/serving 統合、custom Metal Kernel(本開発機に metal compiler
-無し — 事前 compile 済み metallib は Xcode を持つ CI が必要)、
-Unified Memory budget/watermark admission、launchd/pkg/署名/
-notarization(Phase 3)、Metal 追加 error code の proto 反映。
+watermark 段階制御(warning/critical、§10.4)、custom Metal Kernel
+(本開発機に metal compiler 無し — 事前 compile 済み metallib は
+Xcode を持つ CI が必要)、launchd/pkg/Developer ID 署名/notarization
+(Phase 3 — 環境なし)、Metal 追加 error code の proto 反映、
+性能最適化(逐次 PoC のため低速 — Phase 4)。
 
 ## 未実装・未検証(spec §35 に基づく明示)
 

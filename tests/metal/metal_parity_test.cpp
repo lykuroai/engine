@@ -8,7 +8,9 @@
 
 #include "backends/metal/metal_backend.h"
 #include "backends/metal/qwen_metal_model.h"
+#include "core/engine/engine.h"
 #include "core/generation/sampler.h"
+#include "tests/unit/tokenizer_fixture.h"
 #include "model/architectures/qwen/qwen_model.h"
 #include "tests/testutil/tiny_model.h"
 
@@ -128,6 +130,52 @@ TEST_F(MetalParityTest, RejectsCapacityOverrunAndBadTokens) {
               ErrorCode::kContextLengthExceeded);
     EXPECT_EQ(metal_->Prefill(*state, {9999}, logits).code(),
               ErrorCode::kInvalidRequest);
+}
+
+// Engine integration on Metal (addendum Phase 2): streaming order,
+// cancel, and deadline ride the unchanged common core.
+TEST_F(MetalParityTest, EngineStreamsCancelsAndFinishesOnMetal) {
+    auto tok = BpeTokenizer::FromConfig(testfixture::SmallTokenizerConfig());
+    ASSERT_TRUE(tok.status.ok());
+    InferenceEngine engine(
+        std::move(metal_),
+        std::make_unique<BpeTokenizer>(std::move(tok.tokenizer)), {});
+
+    // Completed request with ordered events.
+    InferenceRequest req;
+    req.request_id = "req_metal";
+    req.messages = {{Role::kUser, "hello"}};
+    req.max_output_tokens = 6;
+    req.sampling.temperature = 0.0f;
+    auto submit = engine.Submit(req);
+    ASSERT_TRUE(submit.status.ok()) << submit.status.message();
+    engine.RunUntilIdle();
+    std::vector<StreamEvent> events;
+    while (auto e = submit.events->Pop()) events.push_back(std::move(*e));
+    ASSERT_GE(events.size(), 3u);
+    EXPECT_EQ(events.front().kind, StreamEvent::Kind::kStarted);
+    EXPECT_EQ(events.back().kind, StreamEvent::Kind::kCompleted);
+    EXPECT_EQ(events.back().finish_reason, FinishReason::kLength);
+    for (size_t i = 0; i < events.size(); ++i) {
+        EXPECT_EQ(events[i].sequence, i);
+    }
+
+    // Mid-decode cancel.
+    InferenceRequest req2;
+    req2.request_id = "req_metal_cancel";
+    req2.messages = {{Role::kUser, "hello"}};
+    req2.max_output_tokens = 50;
+    req2.sampling.temperature = 0.0f;
+    auto submit2 = engine.Submit(req2);
+    ASSERT_TRUE(submit2.status.ok());
+    engine.Step();
+    engine.Step();
+    engine.Cancel("req_metal_cancel");
+    engine.RunUntilIdle();
+    std::vector<StreamEvent> events2;
+    while (auto e = submit2.events->Pop()) events2.push_back(std::move(*e));
+    EXPECT_EQ(events2.back().kind, StreamEvent::Kind::kCompleted);
+    EXPECT_EQ(events2.back().finish_reason, FinishReason::kCancelled);
 }
 
 }  // namespace
