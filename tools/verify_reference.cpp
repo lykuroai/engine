@@ -51,7 +51,11 @@ static bool ParseCudaBackend(const std::string& backend,
 
 namespace {
 
-constexpr float kLogitTolerance = 2e-2f;  // FP32, differing op order
+// FP32 backends: near-exact. FP16 (metal-fp16): rounding is O(0.05) on
+// logits, so the meaningful signal is argmax/greedy agreement, not the
+// raw logit delta (addendum §14.1 per-operator tolerance).
+constexpr float kLogitToleranceF32 = 2e-2f;
+constexpr float kLogitToleranceF16 = 0.2f;
 
 std::string ReadAll(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -71,6 +75,8 @@ int main(int argc, char** argv) {
     }
     const std::string artifact_dir = argv[1];
     const std::string backend = argv[3];
+    const float kLogitTolerance =
+        (backend == "metal-fp16") ? kLogitToleranceF16 : kLogitToleranceF32;
 
     ArtifactLoadOptions options;
     options.allow_unsigned_dev = true;
@@ -82,10 +88,13 @@ int main(int argc, char** argv) {
     }
 
     std::unique_ptr<GenerativeModel> model = std::move(loaded.artifact.model);
-    if (backend == "metal") {
+    if (backend == "metal" || backend == "metal-fp16") {
 #ifdef LYKURO_HAVE_METAL
+        MetalModelOptions metal_opts;
+        metal_opts.fp16 = (backend == "metal-fp16");
         auto metal = QwenMetalModel::Load(loaded.artifact.manifest,
-                                          *loaded.artifact.weights);
+                                          *loaded.artifact.weights,
+                                          metal_opts);
         if (!metal.status.ok()) {
             std::fprintf(stderr, "metal load failed: %s\n",
                          metal.status.message().c_str());

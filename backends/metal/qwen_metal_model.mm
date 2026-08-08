@@ -65,7 +65,67 @@ std::vector<float> Transpose(const std::vector<float>& w, size_t rows,
 
 }  // namespace
 
+
+// RMSNorm with FP32-internal reduction (FP16 sum of squares overflows).
+// Returns a tensor in `compute_dt`.
+static MPSGraphTensor* RmsNormGraph(MPSGraph* g, MPSGraphTensor* x,
+                                    MPSGraphTensor* w, float eps,
+                                    bool fp16) {
+    MPSGraphTensor* xf =
+        fp16 ? [g castTensor:x toType:MPSDataTypeFloat32 name:nil] : x;
+    MPSGraphTensor* sq = [g squareWithTensor:xf name:nil];
+    MPSGraphTensor* mean = [g meanOfTensor:sq axes:@[ @1 ] name:nil];
+    MPSGraphTensor* epsc = [g constantWithScalar:double(eps)
+                                           shape:@[ @1, @1 ]
+                                        dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* rs = [g
+        reverseSquareRootWithTensor:[g additionWithPrimaryTensor:mean
+                                                 secondaryTensor:epsc
+                                                            name:nil]
+                               name:nil];
+    MPSGraphTensor* n = [g multiplicationWithPrimaryTensor:xf
+                                          secondaryTensor:rs
+                                                     name:nil];
+    MPSGraphTensor* wf =
+        fp16 ? [g castTensor:w toType:MPSDataTypeFloat32 name:nil] : w;
+    MPSGraphTensor* out = [g multiplicationWithPrimaryTensor:n
+                                             secondaryTensor:wf
+                                                        name:nil];
+    return fp16 ? [g castTensor:out toType:MPSDataTypeFloat16 name:nil]
+                : out;
+}
+
+
+// Matmul with FP32 accumulation. FP16 operands are widened for the
+// reduction (MPSGraph fp16 matmul accumulates in fp16 and overflows on
+// the large hidden/intermediate/vocab reductions), then the result is
+// returned in the compute dtype. Storage/bandwidth stay FP16; only the
+// in-flight accumulator is FP32.
+static MPSGraphTensor* MatMulAcc(MPSGraph* g, MPSGraphTensor* a,
+                                 MPSGraphTensor* b, bool fp16) {
+    if (!fp16) {
+        return [g matrixMultiplicationWithPrimaryTensor:a
+                                        secondaryTensor:b
+                                                   name:nil];
+    }
+    MPSGraphTensor* af = [g castTensor:a toType:MPSDataTypeFloat32
+                                 name:nil];
+    MPSGraphTensor* bf = [g castTensor:b toType:MPSDataTypeFloat32
+                                 name:nil];
+    MPSGraphTensor* c = [g matrixMultiplicationWithPrimaryTensor:af
+                                                 secondaryTensor:bf
+                                                            name:nil];
+    return [g castTensor:c toType:MPSDataTypeFloat16 name:nil];
+}
+
 struct QwenMetalModel::Impl {
+    // Compute/storage dtype: FP16 (addendum initial standard) or FP32
+    // (parity anchor). Logits are always emitted as FP32.
+    bool fp16 = false;
+    MPSDataType dt = MPSDataTypeFloat32;
+    size_t esz = sizeof(float);
+    std::vector<uint16_t> embed_fp16;  // fp16 row source when fp16 mode
+
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLCommandQueue> pf_queue = nil;  // prefill-only queue
@@ -176,17 +236,20 @@ namespace {
 class MetalSequenceState final : public SequenceState {
 public:
     static Status Create(id<MTLDevice> device, const QwenConfig& config,
-                         uint32_t max_tokens,
+                         uint32_t max_tokens, size_t esz,
+                         MPSDataType dt,
                          std::unique_ptr<MetalSequenceState>& out) {
         auto state =
             std::unique_ptr<MetalSequenceState>(new MetalSequenceState());
+        state->esz_ = esz;
+        state->dt_ = dt;
         state->kv_stride_ = config.num_kv_heads * config.head_dim;
         state->max_tokens_ = max_tokens;
         // Rounded up so a [bucket, kv] view never exceeds the buffer.
         const uint32_t alloc_tokens =
             ((max_tokens + kCtxBucket - 1) / kCtxBucket) * kCtxBucket;
         const size_t bytes =
-            size_t(alloc_tokens) * state->kv_stride_ * sizeof(float);
+            size_t(alloc_tokens) * state->kv_stride_ * esz;
         state->keys_.resize(config.num_layers);
         state->values_.resize(config.num_layers);
         for (uint32_t l = 0; l < config.num_layers; ++l) {
@@ -231,22 +294,22 @@ public:
             tds.push_back([[MPSGraphTensorData alloc]
                 initWithMTLBuffer:keys_[l]
                             shape:@[ @(bucket), @(kv_dim) ]
-                         dataType:MPSDataTypeFloat32]);
+                         dataType:dt_]);
             tds.push_back([[MPSGraphTensorData alloc]
                 initWithMTLBuffer:values_[l]
                             shape:@[ @(bucket), @(kv_dim) ]
-                         dataType:MPSDataTypeFloat32]);
+                         dataType:dt_]);
         }
         return kv_td_cache_.emplace(key, std::move(tds)).first->second;
     }
 
-    float* KeyRow(uint32_t layer, uint32_t t) {
-        return static_cast<float*>(keys_[layer].contents) +
-               size_t(t) * kv_stride_;
+    void* KeyRow(uint32_t layer, uint32_t t) {
+        return static_cast<uint8_t*>(keys_[layer].contents) +
+               size_t(t) * kv_stride_ * esz_;
     }
-    float* ValueRow(uint32_t layer, uint32_t t) {
-        return static_cast<float*>(values_[layer].contents) +
-               size_t(t) * kv_stride_;
+    void* ValueRow(uint32_t layer, uint32_t t) {
+        return static_cast<uint8_t*>(values_[layer].contents) +
+               size_t(t) * kv_stride_ * esz_;
     }
     void Advance() { ++length_; }
 
@@ -258,6 +321,8 @@ private:
     std::vector<id<MTLBuffer>> keys_;
     std::vector<id<MTLBuffer>> values_;
     std::map<uint32_t, std::vector<MPSGraphTensorData*>> kv_td_cache_;
+    size_t esz_ = sizeof(float);
+    MPSDataType dt_ = MPSDataTypeFloat32;
 };
 
 NSArray<NSNumber*>* Shape2(uint64_t a, uint64_t b) {
@@ -270,6 +335,12 @@ QwenMetalModel::~QwenMetalModel() = default;
 
 QwenMetalModel::LoadResult QwenMetalModel::Load(
     const ModelManifest& manifest, const SafetensorsFile& weights) {
+    return Load(manifest, weights, MetalModelOptions{});
+}
+
+QwenMetalModel::LoadResult QwenMetalModel::Load(
+    const ModelManifest& manifest, const SafetensorsFile& weights,
+    const MetalModelOptions& options) {
     LoadResult result;
     @autoreleasepool {
         auto model = std::unique_ptr<QwenMetalModel>(new QwenMetalModel());
@@ -282,6 +353,9 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
 
         model->impl_ = std::make_unique<Impl>();
         Impl& impl = *model->impl_;
+        impl.fp16 = options.fp16;
+        impl.dt = options.fp16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+        impl.esz = options.fp16 ? 2 : sizeof(float);
         impl.device = MTLCreateSystemDefaultDevice();
         if (impl.device == nil || !impl.device.hasUnifiedMemory) {
             result.status = Status(ErrorCode::kGpuUnhealthy,
@@ -312,9 +386,12 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                  size_t(c.num_heads) * c.head_dim * h64 +    // o
                  3 * h64 * uint64_t(c.intermediate_size)) *  // mlp
                 sizeof(float);
+            const uint64_t bytes_per = impl.fp16 ? 2 : sizeof(float);
             const uint64_t weight_bytes =
-                uint64_t(c.vocab_size) * h64 * sizeof(float) * 2 +
-                uint64_t(c.num_layers) * per_layer;
+                (uint64_t(c.vocab_size) * h64 * 2 +
+                 uint64_t(c.num_layers) *
+                     (per_layer / sizeof(float))) *
+                bytes_per;
             if (weight_bytes > budget) {
                 result.status =
                     Status(ErrorCode::kCapacityExhausted,
@@ -333,10 +410,21 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
 
         auto upload = [&](const std::vector<float>& host,
                           id<MTLBuffer> __strong& buf) -> Status {
-            buf = [impl.device
-                newBufferWithBytes:host.data()
-                            length:host.size() * sizeof(float)
-                           options:MTLResourceStorageModeShared];
+            if (impl.fp16) {
+                std::vector<uint16_t> half_host(host.size());
+                for (size_t i = 0; i < host.size(); ++i) {
+                    half_host[i] = FloatToFp16(host[i]);
+                }
+                buf = [impl.device
+                    newBufferWithBytes:half_host.data()
+                                length:half_host.size() * 2
+                               options:MTLResourceStorageModeShared];
+            } else {
+                buf = [impl.device
+                    newBufferWithBytes:host.data()
+                                length:host.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+            }
             if (buf == nil) {
                 return Status(ErrorCode::kGpuOom, "weight upload failed",
                               kComponent);
@@ -348,7 +436,7 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
             return [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:buf
                             shape:Shape2(rows, cols)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
         };
 
         std::vector<float> host;
@@ -421,6 +509,12 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
         if (s.ok()) {
             s = TensorToHost(weights, "model.embed_tokens.weight",
                              impl.embed_host, nullptr);
+            if (s.ok() && impl.fp16) {
+                impl.embed_fp16.resize(impl.embed_host.size());
+                for (size_t i = 0; i < impl.embed_host.size(); ++i) {
+                    impl.embed_fp16[i] = FloatToFp16(impl.embed_host[i]);
+                }
+            }
         }
         if (s.ok()) {
             if (c.tie_word_embeddings) {
@@ -449,10 +543,10 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                     newBufferWithLength:bytes
                                 options:MTLResourceStorageModeShared];
             };
-            impl.in_x = alloc(h * sizeof(float));
-            impl.in_cos = alloc(half * sizeof(float));
-            impl.in_sin = alloc(half * sizeof(float));
-            impl.in_mask = alloc((size_t(max_bucket) + 1) * sizeof(float));
+            impl.in_x = alloc(h * impl.esz);
+            impl.in_cos = alloc(half * impl.esz);
+            impl.in_sin = alloc(half * impl.esz);
+            impl.in_mask = alloc((size_t(max_bucket) + 1) * impl.esz);
             impl.stage_logits = alloc(c.vocab_size * sizeof(float));
             if (impl.in_x == nil || impl.in_cos == nil ||
                 impl.in_sin == nil || impl.in_mask == nil ||
@@ -470,8 +564,8 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                 impl.stage_k_td.resize(c.num_layers);
                 impl.stage_v_td.resize(c.num_layers);
                 for (uint32_t l = 0; l < c.num_layers && s.ok(); ++l) {
-                    impl.stage_k[l] = alloc(kv_dim * sizeof(float));
-                    impl.stage_v[l] = alloc(kv_dim * sizeof(float));
+                    impl.stage_k[l] = alloc(kv_dim * impl.esz);
+                    impl.stage_v[l] = alloc(kv_dim * impl.esz);
                     if (impl.stage_k[l] == nil || impl.stage_v[l] == nil) {
                         s = Status(ErrorCode::kGpuOom,
                                    "buffer allocation failed", kComponent);
@@ -480,18 +574,18 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                     impl.stage_k_td[l] = [[MPSGraphTensorData alloc]
                         initWithMTLBuffer:impl.stage_k[l]
                                     shape:Shape2(1, kv_dim)
-                                 dataType:MPSDataTypeFloat32];
+                                 dataType:impl.dt];
                     impl.stage_v_td[l] = [[MPSGraphTensorData alloc]
                         initWithMTLBuffer:impl.stage_v[l]
                                     shape:Shape2(1, kv_dim)
-                                 dataType:MPSDataTypeFloat32];
+                                 dataType:impl.dt];
                 }
                 const uint32_t P = kPrefillChunk;
-                impl.pf_x = alloc(size_t(P) * h * sizeof(float));
-                impl.pf_cos = alloc(size_t(P) * half * sizeof(float));
-                impl.pf_sin = alloc(size_t(P) * half * sizeof(float));
+                impl.pf_x = alloc(size_t(P) * h * impl.esz);
+                impl.pf_cos = alloc(size_t(P) * half * impl.esz);
+                impl.pf_sin = alloc(size_t(P) * half * impl.esz);
                 impl.pf_mask = alloc(size_t(P) * (max_bucket + P) *
-                                     sizeof(float));
+                                     impl.esz);
                 impl.pf_last = alloc(sizeof(int32_t));
                 impl.pf_logits = alloc(c.vocab_size * sizeof(float));
                 impl.pf_logits_td = [[MPSGraphTensorData alloc]
@@ -504,9 +598,9 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                 impl.pf_stage_v_td.resize(c.num_layers);
                 for (uint32_t l = 0; l < c.num_layers && s.ok(); ++l) {
                     impl.pf_stage_k[l] =
-                        alloc(size_t(P) * kv_dim * sizeof(float));
+                        alloc(size_t(P) * kv_dim * impl.esz);
                     impl.pf_stage_v[l] =
-                        alloc(size_t(P) * kv_dim * sizeof(float));
+                        alloc(size_t(P) * kv_dim * impl.esz);
                     if (impl.pf_stage_k[l] == nil ||
                         impl.pf_stage_v[l] == nil) {
                         s = Status(ErrorCode::kGpuOom,
@@ -516,11 +610,11 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                     impl.pf_stage_k_td[l] = [[MPSGraphTensorData alloc]
                         initWithMTLBuffer:impl.pf_stage_k[l]
                                     shape:Shape2(P, kv_dim)
-                                 dataType:MPSDataTypeFloat32];
+                                 dataType:impl.dt];
                     impl.pf_stage_v_td[l] = [[MPSGraphTensorData alloc]
                         initWithMTLBuffer:impl.pf_stage_v[l]
                                     shape:Shape2(P, kv_dim)
-                                 dataType:MPSDataTypeFloat32];
+                                 dataType:impl.dt];
                 }
             }
         }
@@ -558,7 +652,8 @@ Status QwenMetalModel::CreateSequence(uint32_t max_tokens,
                                       std::unique_ptr<SequenceState>& out) {
     std::unique_ptr<MetalSequenceState> state;
     Status s = MetalSequenceState::Create(impl_->device, config_,
-                                          max_tokens, state);
+                                          max_tokens, impl_->esz,
+                                          impl_->dt, state);
     if (!s.ok()) return s;
     out = std::move(state);
     return Status::Ok();
@@ -585,39 +680,21 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
             bg.graph = g;
             const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
             bg.x = [g placeholderWithShape:Shape2(1, h)
-                                  dataType:MPSDataTypeFloat32
+                                  dataType:impl.dt
                                       name:nil];
             bg.cos_in = [g placeholderWithShape:Shape2(1, half)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
             bg.sin_in = [g placeholderWithShape:Shape2(1, half)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
             bg.mask = [g placeholderWithShape:Shape2(1, bucket + 1)
-                                     dataType:MPSDataTypeFloat32
+                                     dataType:impl.dt
                                          name:nil];
             bg.layer_io.resize(c.num_layers);
 
             auto rmsnorm = [&](MPSGraphTensor* x, MPSGraphTensor* w) {
-                MPSGraphTensor* sq = [g squareWithTensor:x name:nil];
-                MPSGraphTensor* mean =
-                    [g meanOfTensor:sq axes:@[ @1 ] name:nil];
-                MPSGraphTensor* eps =
-                    [g constantWithScalar:double(c.rms_norm_eps)
-                                    shape:Shape2(1, 1)
-                                 dataType:MPSDataTypeFloat32];
-                MPSGraphTensor* rs = [g
-                    reverseSquareRootWithTensor:[g additionWithPrimaryTensor:mean
-                                                          secondaryTensor:eps
-                                                                     name:nil]
-                                           name:nil];
-                MPSGraphTensor* n =
-                    [g multiplicationWithPrimaryTensor:x
-                                       secondaryTensor:rs
-                                                  name:nil];
-                return [g multiplicationWithPrimaryTensor:n
-                                          secondaryTensor:w
-                                                     name:nil];
+                return RmsNormGraph(g, x, w, c.rms_norm_eps, impl.fp16);
             };
             auto rope = [&](MPSGraphTensor* v, uint32_t heads) {
                 // [1, heads*hd] -> [heads, hd] -> rotate-half -> back.
@@ -664,64 +741,61 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
             for (uint32_t l = 0; l < c.num_layers; ++l) {
                 Impl::BucketGraph::LayerIo& io = bg.layer_io[l];
                 io.input_norm = [g placeholderWithShape:Shape2(1, h)
-                                               dataType:MPSDataTypeFloat32
+                                               dataType:impl.dt
                                                    name:nil];
                 io.post_norm = [g placeholderWithShape:Shape2(1, h)
-                                              dataType:MPSDataTypeFloat32
+                                              dataType:impl.dt
                                                   name:nil];
                 io.qw = [g
                     placeholderWithShape:Shape2(h, size_t(c.num_heads) *
                                                        c.head_dim)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.kw = [g placeholderWithShape:Shape2(h, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.vw = [g placeholderWithShape:Shape2(h, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.ow = [g
                     placeholderWithShape:Shape2(size_t(c.num_heads) *
                                                     c.head_dim,
                                                 h)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.gate = [g
                     placeholderWithShape:Shape2(h, c.intermediate_size)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.up = [g
                     placeholderWithShape:Shape2(h, c.intermediate_size)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.down = [g
                     placeholderWithShape:Shape2(c.intermediate_size, h)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.qb = [g
                     placeholderWithShape:Shape2(1, size_t(c.num_heads) *
                                                        c.head_dim)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.kb = [g placeholderWithShape:Shape2(1, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.vb = [g placeholderWithShape:Shape2(1, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.k_cache = [g placeholderWithShape:Shape2(bucket, kv_dim)
-                                            dataType:MPSDataTypeFloat32
+                                            dataType:impl.dt
                                                 name:nil];
                 io.v_cache = [g placeholderWithShape:Shape2(bucket, kv_dim)
-                                            dataType:MPSDataTypeFloat32
+                                            dataType:impl.dt
                                                 name:nil];
 
                 MPSGraphTensor* normed = rmsnorm(x, io.input_norm);
                 auto proj = [&](MPSGraphTensor* w, MPSGraphTensor* bias) {
-                    MPSGraphTensor* y =
-                        [g matrixMultiplicationWithPrimaryTensor:normed
-                                                 secondaryTensor:w
-                                                            name:nil];
+                    MPSGraphTensor* y = MatMulAcc(g, normed, w, impl.fp16);
                     if (bias != nil) {
                         y = [g additionWithPrimaryTensor:y
                                          secondaryTensor:bias
@@ -784,14 +858,11 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
                              dimension:1
                          withDimension:2
                                   name:nil];  // [heads, hd, rows]
-                MPSGraphTensor* scores =
-                    [g matrixMultiplicationWithPrimaryTensor:q_h
-                                             secondaryTensor:k_t
-                                                        name:nil];
+                MPSGraphTensor* scores = MatMulAcc(g, q_h, k_t, impl.fp16);
                 MPSGraphTensor* scale =
                     [g constantWithScalar:double(attn_scale)
                                     shape:@[ @1, @1, @1 ]
-                                 dataType:MPSDataTypeFloat32];
+                                 dataType:impl.dt];
                 scores = [g multiplicationWithPrimaryTensor:scores
                                             secondaryTensor:scale
                                                        name:nil];
@@ -804,32 +875,23 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
                                                  name:nil];
                 MPSGraphTensor* probs =
                     [g softMaxWithTensor:scores axis:2 name:nil];
-                MPSGraphTensor* ctx =
-                    [g matrixMultiplicationWithPrimaryTensor:probs
-                                             secondaryTensor:v_h
-                                                        name:nil];
+                MPSGraphTensor* ctx = MatMulAcc(g, probs, v_h, impl.fp16);
                 MPSGraphTensor* ctx_flat = [g
                     reshapeTensor:ctx
                         withShape:Shape2(1, size_t(c.num_heads) *
                                                 c.head_dim)
                              name:nil];
                 MPSGraphTensor* o =
-                    [g matrixMultiplicationWithPrimaryTensor:ctx_flat
-                                             secondaryTensor:io.ow
-                                                        name:nil];
+                    MatMulAcc(g, ctx_flat, io.ow, impl.fp16);
                 x = [g additionWithPrimaryTensor:x
                                  secondaryTensor:o
                                             name:nil];
 
                 MPSGraphTensor* normed2 = rmsnorm(x, io.post_norm);
                 MPSGraphTensor* gate =
-                    [g matrixMultiplicationWithPrimaryTensor:normed2
-                                             secondaryTensor:io.gate
-                                                        name:nil];
+                    MatMulAcc(g, normed2, io.gate, impl.fp16);
                 MPSGraphTensor* up =
-                    [g matrixMultiplicationWithPrimaryTensor:normed2
-                                             secondaryTensor:io.up
-                                                        name:nil];
+                    MatMulAcc(g, normed2, io.up, impl.fp16);
                 MPSGraphTensor* silu = [g
                     multiplicationWithPrimaryTensor:gate
                                     secondaryTensor:[g sigmoidWithTensor:gate
@@ -840,24 +902,23 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
                                        secondaryTensor:up
                                                   name:nil];
                 MPSGraphTensor* down =
-                    [g matrixMultiplicationWithPrimaryTensor:act
-                                             secondaryTensor:io.down
-                                                        name:nil];
+                    MatMulAcc(g, act, io.down, impl.fp16);
                 x = [g additionWithPrimaryTensor:x
                                  secondaryTensor:down
                                             name:nil];
             }
             bg.final_norm = [g placeholderWithShape:Shape2(1, h)
-                                           dataType:MPSDataTypeFloat32
+                                           dataType:impl.dt
                                                name:nil];
             bg.head = [g placeholderWithShape:Shape2(h, c.vocab_size)
-                                     dataType:MPSDataTypeFloat32
+                                     dataType:impl.dt
                                          name:nil];
             MPSGraphTensor* fn = rmsnorm(x, bg.final_norm);
-            bg.logits =
-                [g matrixMultiplicationWithPrimaryTensor:fn
-                                         secondaryTensor:bg.head
-                                                    name:nil];
+            MPSGraphTensor* lg = MatMulAcc(g, fn, bg.head, impl.fp16);
+            bg.logits = impl.fp16 ? [g castTensor:lg
+                                           toType:MPSDataTypeFloat32
+                                             name:nil]
+                                  : lg;
         }
 
         // One-time per-bucket call state: feeds dictionary with the
@@ -869,19 +930,19 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
             feeds[bg.x] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.in_x
                             shape:Shape2(1, h)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             feeds[bg.cos_in] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.in_cos
                             shape:Shape2(1, half)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             feeds[bg.sin_in] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.in_sin
                             shape:Shape2(1, half)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             feeds[bg.mask] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.in_mask
                             shape:Shape2(1, bucket + 1)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             NSMutableDictionary* results = [NSMutableDictionary dictionary];
             NSMutableArray* targets = [NSMutableArray array];
             for (uint32_t l = 0; l < c.num_layers; ++l) {
@@ -913,22 +974,46 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
             bg.targets = targets;
         }
 
-        // Per-token inputs written directly into resident buffers.
-        std::memcpy(impl.in_x.contents,
-                    impl.embed_host.data() + size_t(token) * h,
-                    h * sizeof(float));
-        float* cos_p = static_cast<float*>(impl.in_cos.contents);
-        float* sin_p = static_cast<float*>(impl.in_sin.contents);
-        for (uint32_t i = 0; i < half; ++i) {
-            const float freq =
-                std::pow(c.rope_theta, -2.0f * float(i) / float(c.head_dim));
-            cos_p[i] = std::cos(float(pos) * freq);
-            sin_p[i] = std::sin(float(pos) * freq);
+        // Per-token inputs written directly into resident buffers
+        // (converted to the compute dtype). FP16 mask uses -6e4 (the
+        // representable large negative; -1e30 saturates to -inf).
+        const float neg_inf = impl.fp16 ? -60000.0f : -1e30f;
+        if (impl.fp16) {
+            uint16_t* xp = static_cast<uint16_t*>(impl.in_x.contents);
+            const uint16_t* src = impl.embed_fp16.data() + size_t(token) * h;
+            std::memcpy(xp, src, h * sizeof(uint16_t));
+            uint16_t* cos_p = static_cast<uint16_t*>(impl.in_cos.contents);
+            uint16_t* sin_p = static_cast<uint16_t*>(impl.in_sin.contents);
+            uint16_t* mask_p = static_cast<uint16_t*>(impl.in_mask.contents);
+            for (uint32_t i = 0; i < half; ++i) {
+                const float freq = std::pow(
+                    c.rope_theta, -2.0f * float(i) / float(c.head_dim));
+                cos_p[i] = FloatToFp16(std::cos(float(pos) * freq));
+                sin_p[i] = FloatToFp16(std::sin(float(pos) * freq));
+            }
+            const uint16_t zero = FloatToFp16(0.0f);
+            const uint16_t ninf = FloatToFp16(neg_inf);
+            for (uint32_t t = 0; t < bucket; ++t) {
+                mask_p[t] = t < pos ? zero : ninf;
+            }
+            mask_p[bucket] = zero;
+        } else {
+            std::memcpy(impl.in_x.contents,
+                        impl.embed_host.data() + size_t(token) * h,
+                        h * sizeof(float));
+            float* cos_p = static_cast<float*>(impl.in_cos.contents);
+            float* sin_p = static_cast<float*>(impl.in_sin.contents);
+            for (uint32_t i = 0; i < half; ++i) {
+                const float freq = std::pow(
+                    c.rope_theta, -2.0f * float(i) / float(c.head_dim));
+                cos_p[i] = std::cos(float(pos) * freq);
+                sin_p[i] = std::sin(float(pos) * freq);
+            }
+            float* mask_p = static_cast<float*>(impl.in_mask.contents);
+            for (uint32_t t = 0; t < pos; ++t) mask_p[t] = 0.0f;
+            for (uint32_t t = pos; t < bucket; ++t) mask_p[t] = -1e30f;
+            mask_p[bucket] = 0.0f;
         }
-        float* mask_p = static_cast<float*>(impl.in_mask.contents);
-        for (uint32_t t = 0; t < pos; ++t) mask_p[t] = 0.0f;
-        for (uint32_t t = pos; t < bucket; ++t) mask_p[t] = -1e30f;
-        mask_p[bucket] = 0.0f;
 
         // Per-sequence KV views (cached in the sequence per bucket).
         const auto& kv_tds =
@@ -947,9 +1032,9 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
         // Staging -> cache (unified memory memcpy, no readbacks).
         for (uint32_t l = 0; l < c.num_layers; ++l) {
             std::memcpy(state.KeyRow(l, pos), impl.stage_k[l].contents,
-                        kv_dim_u * sizeof(float));
+                        kv_dim_u * impl.esz);
             std::memcpy(state.ValueRow(l, pos), impl.stage_v[l].contents,
-                        kv_dim_u * sizeof(float));
+                        kv_dim_u * impl.esz);
         }
         if (want_logits) {
             const float* lp =
@@ -991,40 +1076,21 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
             pg.graph = g;
             const float attn_scale = 1.0f / std::sqrt(float(c.head_dim));
             pg.x = [g placeholderWithShape:Shape2(P, h)
-                                  dataType:MPSDataTypeFloat32
+                                  dataType:impl.dt
                                       name:nil];
             pg.cos_in = [g placeholderWithShape:Shape2(P, half)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
             pg.sin_in = [g placeholderWithShape:Shape2(P, half)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
             pg.mask = [g placeholderWithShape:Shape2(P, rows)
-                                     dataType:MPSDataTypeFloat32
+                                     dataType:impl.dt
                                          name:nil];
             pg.layer_io.resize(c.num_layers);
 
             auto rmsnorm = [&](MPSGraphTensor* x, MPSGraphTensor* w) {
-                MPSGraphTensor* sq = [g squareWithTensor:x name:nil];
-                MPSGraphTensor* mean =
-                    [g meanOfTensor:sq axes:@[ @1 ] name:nil];
-                MPSGraphTensor* eps =
-                    [g constantWithScalar:double(c.rms_norm_eps)
-                                    shape:@[ @1, @1 ]
-                                 dataType:MPSDataTypeFloat32];
-                MPSGraphTensor* rs = [g
-                    reverseSquareRootWithTensor:
-                        [g additionWithPrimaryTensor:mean
-                                     secondaryTensor:eps
-                                                name:nil]
-                                           name:nil];
-                MPSGraphTensor* n =
-                    [g multiplicationWithPrimaryTensor:x
-                                       secondaryTensor:rs
-                                                  name:nil];
-                return [g multiplicationWithPrimaryTensor:n
-                                          secondaryTensor:w
-                                                     name:nil];
+                return RmsNormGraph(g, x, w, c.rms_norm_eps, impl.fp16);
             };
             // Rotate-half RoPE over [P, heads*hd] with per-row angles.
             auto rope = [&](MPSGraphTensor* v, uint32_t heads) {
@@ -1077,64 +1143,61 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
             for (uint32_t l = 0; l < c.num_layers; ++l) {
                 Impl::PrefillGraph::LayerIo& io = pg.layer_io[l];
                 io.input_norm = [g placeholderWithShape:Shape2(1, h)
-                                               dataType:MPSDataTypeFloat32
+                                               dataType:impl.dt
                                                    name:nil];
                 io.post_norm = [g placeholderWithShape:Shape2(1, h)
-                                              dataType:MPSDataTypeFloat32
+                                              dataType:impl.dt
                                                   name:nil];
                 io.qw = [g
                     placeholderWithShape:Shape2(h, size_t(c.num_heads) *
                                                        c.head_dim)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.kw = [g placeholderWithShape:Shape2(h, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.vw = [g placeholderWithShape:Shape2(h, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.ow = [g
                     placeholderWithShape:Shape2(size_t(c.num_heads) *
                                                     c.head_dim,
                                                 h)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.gate = [g
                     placeholderWithShape:Shape2(h, c.intermediate_size)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.up = [g
                     placeholderWithShape:Shape2(h, c.intermediate_size)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.down = [g
                     placeholderWithShape:Shape2(c.intermediate_size, h)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.qb = [g
                     placeholderWithShape:Shape2(1, size_t(c.num_heads) *
                                                        c.head_dim)
-                                dataType:MPSDataTypeFloat32
+                                dataType:impl.dt
                                     name:nil];
                 io.kb = [g placeholderWithShape:Shape2(1, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.vb = [g placeholderWithShape:Shape2(1, kv_dim)
-                                       dataType:MPSDataTypeFloat32
+                                       dataType:impl.dt
                                            name:nil];
                 io.k_cache = [g placeholderWithShape:Shape2(bucket, kv_dim)
-                                            dataType:MPSDataTypeFloat32
+                                            dataType:impl.dt
                                                 name:nil];
                 io.v_cache = [g placeholderWithShape:Shape2(bucket, kv_dim)
-                                            dataType:MPSDataTypeFloat32
+                                            dataType:impl.dt
                                                 name:nil];
 
                 MPSGraphTensor* normed = rmsnorm(x, io.input_norm);
                 auto proj = [&](MPSGraphTensor* w, MPSGraphTensor* bias) {
-                    MPSGraphTensor* y =
-                        [g matrixMultiplicationWithPrimaryTensor:normed
-                                                 secondaryTensor:w
-                                                            name:nil];
+                    MPSGraphTensor* y = MatMulAcc(g, normed, w, impl.fp16);
                     if (bias != nil) {
                         y = [g additionWithPrimaryTensor:y
                                          secondaryTensor:bias
@@ -1199,14 +1262,11 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
                              dimension:1
                          withDimension:2
                                   name:nil];  // [heads, hd, rows]
-                MPSGraphTensor* scores =
-                    [g matrixMultiplicationWithPrimaryTensor:q_h
-                                             secondaryTensor:k_t
-                                                        name:nil];
+                MPSGraphTensor* scores = MatMulAcc(g, q_h, k_t, impl.fp16);
                 MPSGraphTensor* scale =
                     [g constantWithScalar:double(attn_scale)
                                     shape:@[ @1, @1, @1 ]
-                                 dataType:MPSDataTypeFloat32];
+                                 dataType:impl.dt];
                 scores = [g multiplicationWithPrimaryTensor:scores
                                             secondaryTensor:scale
                                                        name:nil];
@@ -1219,10 +1279,7 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
                                                  name:nil];
                 MPSGraphTensor* probs =
                     [g softMaxWithTensor:scores axis:2 name:nil];
-                MPSGraphTensor* ctx =
-                    [g matrixMultiplicationWithPrimaryTensor:probs
-                                             secondaryTensor:v_h
-                                                        name:nil];
+                MPSGraphTensor* ctx = MatMulAcc(g, probs, v_h, impl.fp16);
                 MPSGraphTensor* ctx_flat = [g
                     reshapeTensor:[g transposeTensor:ctx
                                            dimension:0
@@ -1232,22 +1289,16 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
                                                 c.head_dim)
                              name:nil];
                 MPSGraphTensor* o =
-                    [g matrixMultiplicationWithPrimaryTensor:ctx_flat
-                                             secondaryTensor:io.ow
-                                                        name:nil];
+                    MatMulAcc(g, ctx_flat, io.ow, impl.fp16);
                 x = [g additionWithPrimaryTensor:x
                                  secondaryTensor:o
                                             name:nil];
 
                 MPSGraphTensor* normed2 = rmsnorm(x, io.post_norm);
                 MPSGraphTensor* gate =
-                    [g matrixMultiplicationWithPrimaryTensor:normed2
-                                             secondaryTensor:io.gate
-                                                        name:nil];
+                    MatMulAcc(g, normed2, io.gate, impl.fp16);
                 MPSGraphTensor* up =
-                    [g matrixMultiplicationWithPrimaryTensor:normed2
-                                             secondaryTensor:io.up
-                                                        name:nil];
+                    MatMulAcc(g, normed2, io.up, impl.fp16);
                 MPSGraphTensor* silu = [g
                     multiplicationWithPrimaryTensor:gate
                                     secondaryTensor:
@@ -1259,18 +1310,16 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
                                        secondaryTensor:up
                                                   name:nil];
                 MPSGraphTensor* down =
-                    [g matrixMultiplicationWithPrimaryTensor:act
-                                             secondaryTensor:io.down
-                                                        name:nil];
+                    MatMulAcc(g, act, io.down, impl.fp16);
                 x = [g additionWithPrimaryTensor:x
                                  secondaryTensor:down
                                             name:nil];
             }
             pg.final_norm = [g placeholderWithShape:Shape2(1, h)
-                                           dataType:MPSDataTypeFloat32
+                                           dataType:impl.dt
                                                name:nil];
             pg.head = [g placeholderWithShape:Shape2(h, c.vocab_size)
-                                     dataType:MPSDataTypeFloat32
+                                     dataType:impl.dt
                                          name:nil];
             // The overlap-chunk contract puts the last real token in the
             // final row, so a static slice suffices.
@@ -1278,10 +1327,11 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
                 [g sliceTensor:x dimension:0 start:P - 1 length:1
                           name:nil];
             MPSGraphTensor* fn = rmsnorm(last, pg.final_norm);
-            pg.logits =
-                [g matrixMultiplicationWithPrimaryTensor:fn
-                                         secondaryTensor:pg.head
-                                                    name:nil];
+            MPSGraphTensor* lg = MatMulAcc(g, fn, pg.head, impl.fp16);
+            pg.logits = impl.fp16 ? [g castTensor:lg
+                                           toType:MPSDataTypeFloat32
+                                             name:nil]
+                                  : lg;
         }
 
         if (pg.feeds == nil) {
@@ -1289,19 +1339,19 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
             feeds[pg.x] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.pf_x
                             shape:Shape2(P, h)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             feeds[pg.cos_in] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.pf_cos
                             shape:Shape2(P, half)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             feeds[pg.sin_in] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.pf_sin
                             shape:Shape2(P, half)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             feeds[pg.mask] = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:impl.pf_mask
                             shape:Shape2(P, rows)
-                         dataType:MPSDataTypeFloat32];
+                         dataType:impl.dt];
             NSMutableDictionary* results = [NSMutableDictionary dictionary];
             for (uint32_t l = 0; l < c.num_layers; ++l) {
                 Impl::Layer& lw = impl.layers[l];
@@ -1329,30 +1379,64 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
         }
 
         // Inputs: embeddings, angles, causal mask (row stride = rows).
-        float* xp = static_cast<float*>(impl.pf_x.contents);
-        for (uint32_t i = 0; i < P; ++i) {
-            std::memcpy(xp + size_t(i) * h,
-                        impl.embed_host.data() + size_t(tokens[i]) * h,
-                        h * sizeof(float));
-        }
-        float* cos_p = static_cast<float*>(impl.pf_cos.contents);
-        float* sin_p = static_cast<float*>(impl.pf_sin.contents);
-        for (uint32_t i = 0; i < P; ++i) {
-            for (uint32_t j = 0; j < half; ++j) {
-                const float freq = std::pow(
-                    c.rope_theta, -2.0f * float(j) / float(c.head_dim));
-                cos_p[i * half + j] = std::cos(float(pos0 + i) * freq);
-                sin_p[i * half + j] = std::sin(float(pos0 + i) * freq);
+        const float neg_inf = impl.fp16 ? -60000.0f : -1e30f;
+        if (impl.fp16) {
+            uint16_t* xp = static_cast<uint16_t*>(impl.pf_x.contents);
+            for (uint32_t i = 0; i < P; ++i) {
+                std::memcpy(xp + size_t(i) * h,
+                            impl.embed_fp16.data() + size_t(tokens[i]) * h,
+                            h * sizeof(uint16_t));
             }
-        }
-        float* mask_p = static_cast<float*>(impl.pf_mask.contents);
-        for (uint32_t i = 0; i < P; ++i) {
-            float* row = mask_p + size_t(i) * rows;
-            for (uint32_t t = 0; t < bucket; ++t) {
-                row[t] = t < pos0 ? 0.0f : -1e30f;
+            uint16_t* cos_p = static_cast<uint16_t*>(impl.pf_cos.contents);
+            uint16_t* sin_p = static_cast<uint16_t*>(impl.pf_sin.contents);
+            for (uint32_t i = 0; i < P; ++i) {
+                for (uint32_t j = 0; j < half; ++j) {
+                    const float freq = std::pow(
+                        c.rope_theta, -2.0f * float(j) / float(c.head_dim));
+                    cos_p[i * half + j] =
+                        FloatToFp16(std::cos(float(pos0 + i) * freq));
+                    sin_p[i * half + j] =
+                        FloatToFp16(std::sin(float(pos0 + i) * freq));
+                }
             }
-            for (uint32_t j = 0; j < P; ++j) {
-                row[bucket + j] = j <= i ? 0.0f : -1e30f;
+            uint16_t* mask_p = static_cast<uint16_t*>(impl.pf_mask.contents);
+            const uint16_t zero = FloatToFp16(0.0f);
+            const uint16_t ninf = FloatToFp16(neg_inf);
+            for (uint32_t i = 0; i < P; ++i) {
+                uint16_t* row = mask_p + size_t(i) * rows;
+                for (uint32_t t = 0; t < bucket; ++t) {
+                    row[t] = t < pos0 ? zero : ninf;
+                }
+                for (uint32_t j = 0; j < P; ++j) {
+                    row[bucket + j] = j <= i ? zero : ninf;
+                }
+            }
+        } else {
+            float* xp = static_cast<float*>(impl.pf_x.contents);
+            for (uint32_t i = 0; i < P; ++i) {
+                std::memcpy(xp + size_t(i) * h,
+                            impl.embed_host.data() + size_t(tokens[i]) * h,
+                            h * sizeof(float));
+            }
+            float* cos_p = static_cast<float*>(impl.pf_cos.contents);
+            float* sin_p = static_cast<float*>(impl.pf_sin.contents);
+            for (uint32_t i = 0; i < P; ++i) {
+                for (uint32_t j = 0; j < half; ++j) {
+                    const float freq = std::pow(
+                        c.rope_theta, -2.0f * float(j) / float(c.head_dim));
+                    cos_p[i * half + j] = std::cos(float(pos0 + i) * freq);
+                    sin_p[i * half + j] = std::sin(float(pos0 + i) * freq);
+                }
+            }
+            float* mask_p = static_cast<float*>(impl.pf_mask.contents);
+            for (uint32_t i = 0; i < P; ++i) {
+                float* row = mask_p + size_t(i) * rows;
+                for (uint32_t t = 0; t < bucket; ++t) {
+                    row[t] = t < pos0 ? 0.0f : -1e30f;
+                }
+                for (uint32_t j = 0; j < P; ++j) {
+                    row[bucket + j] = j <= i ? 0.0f : -1e30f;
+                }
             }
         }
 
@@ -1374,10 +1458,10 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
         for (uint32_t l = 0; l < c.num_layers; ++l) {
             std::memcpy(state.KeyRow(l, pos0),
                         impl.pf_stage_k[l].contents,
-                        size_t(P) * kv_dim * sizeof(float));
+                        size_t(P) * kv_dim * impl.esz);
             std::memcpy(state.ValueRow(l, pos0),
                         impl.pf_stage_v[l].contents,
-                        size_t(P) * kv_dim * sizeof(float));
+                        size_t(P) * kv_dim * impl.esz);
         }
         if (want_logits) {
             const float* lp =

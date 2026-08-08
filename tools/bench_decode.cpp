@@ -64,10 +64,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::unique_ptr<GenerativeModel> model = std::move(loaded.artifact.model);
-    if (backend == "metal") {
+    if (backend == "metal" || backend == "metal-fp16") {
 #ifdef LYKURO_HAVE_METAL
+        MetalModelOptions metal_opts;
+        metal_opts.fp16 = (backend == "metal-fp16");
         auto metal = QwenMetalModel::Load(loaded.artifact.manifest,
-                                          *loaded.artifact.weights);
+                                          *loaded.artifact.weights,
+                                          metal_opts);
         if (!metal.status.ok()) {
             std::fprintf(stderr, "metal load failed: %s\n",
                          metal.status.message().c_str());

@@ -132,6 +132,55 @@ TEST_F(MetalParityTest, RejectsCapacityOverrunAndBadTokens) {
               ErrorCode::kInvalidRequest);
 }
 
+// FP16 mode (addendum §2.1 initial precision): weights/activations/KV in
+// FP16 with FP32-accumulated matmuls and FP32 logits. Compared against
+// the CPU FP32 reference with an FP16-appropriate tolerance; greedy
+// agreement is the meaningful correctness signal.
+TEST_F(MetalParityTest, Fp16MatchesGreedyAndStaysClose) {
+    MetalModelOptions opts;
+    opts.fp16 = true;
+    auto fp16 = QwenMetalModel::Load(manifest_, file_, opts);
+    ASSERT_TRUE(fp16.status.ok()) << fp16.status.message();
+
+    const std::vector<uint32_t> prompt = {1, 5, 9, 2, 17, 250};
+    std::unique_ptr<SequenceState> cpu_state, fp16_state;
+    ASSERT_TRUE(cpu_->CreateSequence(128, cpu_state).ok());
+    ASSERT_TRUE(fp16.model->CreateSequence(128, fp16_state).ok());
+    std::vector<float> cpu_logits, fp16_logits;
+    ASSERT_TRUE(cpu_->Prefill(*cpu_state, prompt, cpu_logits).ok());
+    ASSERT_TRUE(fp16.model->Prefill(*fp16_state, prompt, fp16_logits).ok());
+    // Loose bound: FP16 rounding, not a bug detector.
+    ExpectClose(cpu_logits, fp16_logits, 0.3f, "fp16 prefill logits");
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    Sampler s1(greedy), s2(greedy);
+    for (int step = 0; step < 16; ++step) {
+        uint32_t t1 = 0, t2 = 0;
+        ASSERT_TRUE(s1.Sample(cpu_logits, t1).ok());
+        ASSERT_TRUE(s2.Sample(fp16_logits, t2).ok());
+        ASSERT_EQ(t1, t2) << "fp16 greedy divergence at step " << step;
+        ASSERT_TRUE(cpu_->Decode(*cpu_state, t1, cpu_logits).ok());
+        ASSERT_TRUE(fp16.model->Decode(*fp16_state, t2, fp16_logits).ok());
+    }
+
+    // Determinism under FP16.
+    auto run = [&](std::vector<float>& out) {
+        std::unique_ptr<SequenceState> st;
+        ASSERT_TRUE(fp16.model->CreateSequence(64, st).ok());
+        std::vector<float> lg;
+        ASSERT_TRUE(fp16.model->Prefill(*st, {1, 2, 3}, lg).ok());
+        for (int i = 0; i < 4; ++i) {
+            ASSERT_TRUE(fp16.model->Decode(*st, uint32_t(i), lg).ok());
+        }
+        out = lg;
+    };
+    std::vector<float> a, b;
+    run(a);
+    run(b);
+    EXPECT_EQ(a, b);
+}
+
 // Engine integration on Metal (addendum Phase 2): streaming order,
 // cancel, and deadline ride the unchanged common core.
 TEST_F(MetalParityTest, EngineStreamsCancelsAndFinishesOnMetal) {

@@ -114,11 +114,27 @@ decode は ctx bucket 拡大で逓減(bucket256 で ~48 tok/s)。
 計測知見: 「chunked prefill 後の decode 劣化」に見えた現象は decode
 graph 初回コンパイルの計上位置の差であり、pre-warm で解消。
 
-Metal 未実装項目: FP16 化(operator 別 tolerance 定義とセット)、
-watermark 段階制御(warning/critical、§10.4)、custom Metal Kernel
-(本開発機に metal compiler 無し)、launchd/pkg/Developer ID 署名/
-notarization(Phase 3 — 環境なし)、Metal error code の proto 反映、
-decode の bucket 逓減対策・batched decode(Phase 4 続き)。
+**FP16(§2.1 初期精度標準)実装済み**: weights / activations / KV を
+FP16 化(`metal-fp16`)。数値安全策として RMSNorm は FP32 で reduce、
+matmul は FP32 accumulate(FP16 accumulate は down_proj / lm_head の
+大 reduction で 65504 を超え overflow するため、storage は FP16 のまま
+in-flight accumulator のみ FP32 に widen)、mask は −6e4、logits は
+最終段で FP32 出力(sampler/API 契約は不変)。実測(M4 Pro、
+Qwen2.5-0.5B):
+
+- **resident VRAM: 2417MB → 1468MB(−39%)**、weights は 988→494MB
+- 品質: oracle argmax 3/3・**greedy 96/96 完全一致**、logits 差
+  0.04〜0.06(FP16 丸め。§14.1 の per-operator tolerance として
+  verify tool に FP16 用閾値 0.2 を分離)
+- decode: 46 tok/s(FP32 の 82 より遅い)。**この小 model の decode は
+  カーネル起動レイテンシ律速で、matmul 毎の widen cast が上乗せに
+  なるため**。FP16 の速度便益は帯域律速となる大 model / batched decode
+  で発現する見込み。メモリ削減は即座に有効
+
+Metal 未実装項目: watermark 段階制御(warning/critical、§10.4)、
+custom Metal Kernel(本開発機に metal compiler 無し)、launchd/pkg/
+Developer ID 署名/notarization(Phase 3 — 環境なし)、Metal error
+code の proto 反映、decode の bucket 逓減対策・batched decode。
 
 ## 未実装・未検証(spec §35 に基づく明示)
 

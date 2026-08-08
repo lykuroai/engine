@@ -27,6 +27,12 @@ namespace lykuro::nie {
 //  - KV cache: bounded contiguous unified-memory buffers per sequence
 //    (spec MVP §16); the new K/V row is written back by the host after
 //    each step (unified memory, no transfer).
+struct MetalModelOptions {
+    // FP16 is the addendum's initial precision standard (§2.1). FP32 is
+    // retained as the parity anchor against the CPU reference.
+    bool fp16 = false;
+};
+
 class QwenMetalModel : public GenerativeModel {
 public:
     struct LoadResult {
@@ -36,6 +42,9 @@ public:
 
     static LoadResult Load(const ModelManifest& manifest,
                            const SafetensorsFile& weights);
+    static LoadResult Load(const ModelManifest& manifest,
+                           const SafetensorsFile& weights,
+                           const MetalModelOptions& options);
 
     ~QwenMetalModel() override;
     QwenMetalModel(const QwenMetalModel&) = delete;
