@@ -274,25 +274,35 @@ public:
                              kCtxBucket);
         const size_t new_bytes = size_t(grown) * kv_stride_ * esz_;
         const size_t old_bytes = size_t(alloc_tokens_) * kv_stride_ * esz_;
-        for (uint32_t l = 0; l < keys_.size(); ++l) {
-            id<MTLBuffer> nk =
-                [device_ newBufferWithLength:new_bytes
-                                     options:MTLResourceStorageModeShared];
-            id<MTLBuffer> nv =
-                [device_ newBufferWithLength:new_bytes
-                                     options:MTLResourceStorageModeShared];
-            if (nk == nil || nv == nil) {
-                return Status(ErrorCode::kGpuOom,
-                              "kv cache allocation failed", kComponent);
+        __block bool oom = false;
+        // Drain autoreleased Metal temporaries here: this runs on the
+        // engine worker thread, which has no ambient pool, so buffers
+        // created below would otherwise accumulate (a ~6MB/request leak).
+        @autoreleasepool {
+            for (uint32_t l = 0; l < keys_.size(); ++l) {
+                id<MTLBuffer> nk = [device_
+                    newBufferWithLength:new_bytes
+                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> nv = [device_
+                    newBufferWithLength:new_bytes
+                                options:MTLResourceStorageModeShared];
+                if (nk == nil || nv == nil) {
+                    oom = true;
+                    break;
+                }
+                std::memset(nk.contents, 0, new_bytes);
+                std::memset(nv.contents, 0, new_bytes);
+                if (keys_[l] != nil && old_bytes > 0) {
+                    std::memcpy(nk.contents, keys_[l].contents, old_bytes);
+                    std::memcpy(nv.contents, values_[l].contents, old_bytes);
+                }
+                keys_[l] = nk;
+                values_[l] = nv;
             }
-            std::memset(nk.contents, 0, new_bytes);
-            std::memset(nv.contents, 0, new_bytes);
-            if (keys_[l] != nil && old_bytes > 0) {
-                std::memcpy(nk.contents, keys_[l].contents, old_bytes);
-                std::memcpy(nv.contents, values_[l].contents, old_bytes);
-            }
-            keys_[l] = nk;
-            values_[l] = nv;
+        }
+        if (oom) {
+            return Status(ErrorCode::kGpuOom, "kv cache allocation failed",
+                          kComponent);
         }
         alloc_tokens_ = grown;
         kv_td_cache_.clear();  // views point at the old buffers
@@ -338,6 +348,18 @@ public:
                size_t(t) * kv_stride_ * esz_;
     }
     void Advance() { ++length_; }
+
+    // Release the KV buffers and cached TensorData views inside an
+    // autoreleasepool. The engine worker thread has no ambient pool, so
+    // Metal's deferred autoreleases from -dealloc would otherwise
+    // accumulate (~6MB per destroyed sequence).
+    ~MetalSequenceState() {
+        @autoreleasepool {
+            kv_td_cache_.clear();
+            for (auto& b : keys_) b = nil;
+            for (auto& b : values_) b = nil;
+        }
+    }
 
 private:
     MetalSequenceState() = default;
@@ -1047,17 +1069,22 @@ Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,
             mask_p[bucket] = 0.0f;
         }
 
-        // Per-sequence KV views (cached in the sequence per bucket).
+        // Per-sequence KV views go into a per-call copy of the cached
+        // (weight + resident-input) feeds. Mutating the model-lifetime
+        // bg.feeds with per-sequence TensorData would retain each
+        // completed sequence's KV buffers (a ~6MB/request leak); the copy
+        // drains with this autoreleasepool instead.
+        NSMutableDictionary* call_feeds = [bg.feeds mutableCopy];
         const auto& kv_tds =
             state.KvTds(bucket, c.num_layers, kv_dim_u);
         for (uint32_t l = 0; l < c.num_layers; ++l) {
             Impl::BucketGraph::LayerIo& io = bg.layer_io[l];
-            bg.feeds[io.k_cache] = kv_tds[size_t(l) * 2];
-            bg.feeds[io.v_cache] = kv_tds[size_t(l) * 2 + 1];
+            call_feeds[io.k_cache] = kv_tds[size_t(l) * 2];
+            call_feeds[io.v_cache] = kv_tds[size_t(l) * 2 + 1];
         }
 
         [bg.graph runWithMTLCommandQueue:impl.queue
-                                   feeds:bg.feeds
+                                   feeds:call_feeds
                         targetOperations:nil
                        resultsDictionary:bg.results];
 
@@ -1477,17 +1504,19 @@ Status QwenMetalModel::ForwardChunk(const uint32_t* tokens, uint32_t pos0,
         }
 
         // Distinct TD namespace: sharing TensorData objects between the
-        // prefill and decode graphs degrades later decode runs.
+        // prefill and decode graphs degrades later decode runs. Per-call
+        // feeds copy so completed sequences' KV buffers are not retained.
+        NSMutableDictionary* call_feeds = [pg.feeds mutableCopy];
         const auto& kv_tds =
             state.KvTds(bucket | 0x80000000u, c.num_layers, kv_dim);
         for (uint32_t l = 0; l < c.num_layers; ++l) {
             Impl::PrefillGraph::LayerIo& io = pg.layer_io[l];
-            pg.feeds[io.k_cache] = kv_tds[size_t(l) * 2];
-            pg.feeds[io.v_cache] = kv_tds[size_t(l) * 2 + 1];
+            call_feeds[io.k_cache] = kv_tds[size_t(l) * 2];
+            call_feeds[io.v_cache] = kv_tds[size_t(l) * 2 + 1];
         }
 
         [pg.graph runWithMTLCommandQueue:impl.pf_queue
-                                   feeds:pg.feeds
+                                   feeds:call_feeds
                         targetOperations:nil
                        resultsDictionary:pg.results];
 
