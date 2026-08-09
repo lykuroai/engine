@@ -38,7 +38,7 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | No Python/Node/Homebrew/Xcode in production | ✅ | host-native binary + frameworks |
 | No third-party inference server | ✅ | same CI gate |
 | Developer ID sign, notarization, Hardened Runtime | ⏸ | no Developer ID in env; Hardened Runtime declared in plan |
-| unit/golden/integration/security/perf/soak results | ◑ | all but 24h Metal soak (deferred by request) |
+| unit/golden/integration/security/perf/soak results | ◑ | 176/176 tests green; 24h Metal soak running (per-request footprint leak fixed, flat at 2652MB) |
 | Mac mini M4 64GB Certified Profile (measured) | ◑ | M4 Pro 64GB dev figures captured; formal profile pending |
 | install/monitor/update/rollback/recovery docs | ◑ | scaffolding in `deploy/macos` |
 | SBOM/provenance/license/vuln report | ✅ | shared SBOM; vuln scan is a CI gate |
@@ -48,7 +48,10 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 
 1. ~~24h CUDA soak~~ ✅ passed (237k requests, 0 failed, RSS bit-identical,
    100 reload cycles leak-free); 24h Metal soak re-running under
-   `caffeinate` (first attempt died ~5h in to system idle sleep).
+   `caffeinate` after fixing a ~6MB/request phys_footprint leak
+   (missing autorelease-pool drain on the worker thread; now flat at
+   2652MB across heartbeats). Earlier attempts died to system idle
+   sleep and then to the leak.
 2. macOS Developer ID signing + Apple notarization + Gatekeeper test.
 3. Formal Certified Profile issuance from a signed-artifact-only,
    security-reviewed build.
