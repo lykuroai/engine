@@ -188,6 +188,7 @@ int main(int argc, char** argv) {
         bool baselined = false;
 
         const auto start_time = std::chrono::steady_clock::now();
+        auto last_heartbeat = start_time;
         const auto deadline = start_time + std::chrono::seconds(seconds);
         uint64_t next_id = 0;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -253,6 +254,20 @@ int main(int argc, char** argv) {
                 mem_start = ProcessMemoryBytes();
                 rss_start = long(mem_start / 1024);
                 baselined = true;
+            }
+            // Heartbeat: process footprint + completion count every 5 min,
+            // so a long soak's memory trend is visible without waiting for
+            // the final report.
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_heartbeat >= std::chrono::minutes(5)) {
+                last_heartbeat = now;
+                const auto mins = std::chrono::duration_cast<
+                    std::chrono::minutes>(now - start_time).count();
+                std::printf(
+                    "heartbeat: t+%lldmin completed=%llu footprint_mb=%.0f\n",
+                    (long long)mins, (unsigned long long)completed,
+                    double(ProcessMemoryBytes()) / 1048576.0);
+                std::fflush(stdout);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
