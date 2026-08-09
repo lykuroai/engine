@@ -16,7 +16,7 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | Scheduler, batch, KV, cancel, deadline | ✅ | + continuous/paged/prefix cache |
 | mTLS, signed artifact, egress deny, non-root | ✅ | non-root documented in launchd/plist |
 | No prompt/response in log/metric/trace/disk | ✅ | content-free logger + tests |
-| unit/golden/integration/security/perf/soak tests | ◑ | all but 24h soak (running) |
+| unit/golden/integration/security/perf/soak tests | ✅ | incl. 24h CUDA soak (237k req, 0 failed, 0 RSS drift, 100 reload leak-free) |
 | Certified hw/model profile issued | ◑ | dev-measured; production cert pending |
 | SBOM, provenance, signature, license notice | ✅ | `sbom/`, `licenses/`, signed manifest |
 | deployment/monitoring/update/rollback/recovery docs | ◑ | launchd + release/rollback notes; full runbook pending |
@@ -46,7 +46,9 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 
 ## Remaining before production sign-off
 
-1. 24h CUDA soak result (in progress) and 24h Metal soak (deferred).
+1. ~~24h CUDA soak~~ ✅ passed (237k requests, 0 failed, RSS bit-identical,
+   100 reload cycles leak-free); 24h Metal soak re-running under
+   `caffeinate` (first attempt died ~5h in to system idle sleep).
 2. macOS Developer ID signing + Apple notarization + Gatekeeper test.
 3. Formal Certified Profile issuance from a signed-artifact-only,
    security-reviewed build.
