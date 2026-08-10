@@ -38,8 +38,8 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | No Python/Node/Homebrew/Xcode in production | ✅ | host-native binary + frameworks |
 | No third-party inference server | ✅ | same CI gate |
 | Developer ID sign, notarization, Hardened Runtime | ⏸ | no Developer ID in env; Hardened Runtime declared in plan |
-| unit/golden/integration/security/perf/soak results | ◑ | 176/176 tests green; 24h Metal soak running (per-request footprint leak fixed, flat at 2652MB) |
-| Mac mini M4 64GB Certified Profile (measured) | ◑ | M4 Pro 64GB dev figures captured; formal profile pending |
+| unit/golden/integration/security/perf/soak results | ✅ | 176/176 tests green; 24h Metal soak PASSED (137440 completed, 0 failed, footprint flat ~2656MB, 100 reload cycles leak 11.7MB) |
+| Mac mini M4 64GB Certified Profile (measured) | ◑ | dev-measured profile issued: `cp_qwen25_05b_m4pro_dev1.yaml` (incl. 24h soak); formal/cross-host cert pending |
 | install/monitor/update/rollback/recovery docs | ◑ | scaffolding in `deploy/macos` |
 | SBOM/provenance/license/vuln report | ✅ | shared SBOM; vuln scan is a CI gate |
 | Unimplemented/unverified/underperformance documented | ✅ | README + this file |
@@ -47,11 +47,12 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 ## Remaining before production sign-off
 
 1. ~~24h CUDA soak~~ ✅ passed (237k requests, 0 failed, RSS bit-identical,
-   100 reload cycles leak-free); 24h Metal soak re-running under
-   `caffeinate` after fixing a ~6MB/request phys_footprint leak
-   (missing autorelease-pool drain on the worker thread; now flat at
-   2652MB across heartbeats). Earlier attempts died to system idle
-   sleep and then to the leak.
+   100 reload cycles leak-free). ~~24h Metal soak~~ ✅ passed
+   (137440 completed, 0 failed, footprint flat ~2656MB over 24h,
+   100 reload cycles leak 11.7MB < 128MB gate) after fixing a
+   ~6MB/request phys_footprint leak (missing autorelease-pool drain
+   on the worker thread). Earlier attempts died to system idle sleep
+   and then to the leak; final run under `caffeinate`.
 2. macOS Developer ID signing + Apple notarization + Gatekeeper test.
 3. Formal Certified Profile issuance from a signed-artifact-only,
    security-reviewed build.

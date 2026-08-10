@@ -1,0 +1,91 @@
+# Certified Profile (DEVELOPMENT MEASUREMENT) — spec §25.1 / addendum §34
+#
+# Status: dev-measured. All figures below were measured on the hardware
+# listed, but this profile has NOT passed the full production
+# certification gate (formal security review, signed+notarized release,
+# cross-host variance). It must not be presented to customers as a
+# certified contract value.
+
+profile_id: cp_qwen25_05b_m4pro_dev1
+status: dev_measured
+engine_version: 0.1.0
+engine_git: lykuroai/engine@main (2026-08-10)
+architecture_plugin: approved_qwen_decoder_v1
+model_artifact: Qwen2.5-0.5B-Instruct (BF16 source, converted via tools/convert_hf_qwen.py)
+
+hardware:
+  chip: Apple M4 Pro
+  gpu: integrated (Apple, unified memory)
+  unified_memory_gb: 64
+  host_os: macOS 26.5.2
+  toolchain: Apple Command Line Tools (no Xcode; MPSGraph via frameworks)
+
+configuration:
+  backend: Metal (MPSGraph)
+  precision: fp32 (default); fp16 available (metal-fp16)
+  context_tokens: 32768 (logical); physical KV lazy-grown per bucket
+  max_sequences: 8
+  kv: contiguous per-sequence, lazy-grown in 128-token buckets (doubling)
+  decode_path: resident shared MTLBuffer feeds, bucket-cached graphs,
+               multi-token prefill graph (P=32), load-time graph pre-warm
+
+correctness:
+  oracle: HF transformers FP32, 3 prompts (EN/math/JA)
+  fp32:
+    matmul_gpu_vs_host_max_diff: 0.0   # MPSGraph matmul == host reference
+    oracle_agreement: 3/3
+  fp16:
+    argmax_agreement: 3/3
+    greedy_agreement: 96/96 tokens
+    logits_max_diff: 0.04..0.06        # FP16 rounding; per-op tolerance §14.1
+    numerics: RMSNorm reduced in FP32, matmul FP32-accumulate, mask -6e4,
+              logits emitted FP32 (sampler/API contract unchanged)
+
+measured_targets:  # M4 Pro, Qwen2.5-0.5B, gateway excluded (engine-local)
+  fp32:
+    decode_tokens_per_second:
+      short_ctx: 87
+      ctx_bucket256: 48        # decode tapers as ctx bucket grows
+    ttft_ms_39tok_prompt: 43
+    prefill_effective_tokens_per_second_329tok: 153
+  fp16:
+    resident_vram_mb: 1468     # vs 2417 fp32 (-39%)
+    weight_vram_mb: 494        # vs 988 fp32
+
+stability:
+  soak_24h:                    # AT-14 / spec §30.5, M4 Pro, 2026-08-09/10
+    seconds: 86400
+    submitted: 140937
+    completed: 137440
+    cancelled: 3497            # intentional mid-flight cancels
+    failed: 0
+    rejected: 0
+    output_tokens: 4733376
+    aggregate_tokens_per_s: 54.8   # mixed load, max_sequences=8
+    footprint_start_mb: 3853.9     # warm-up peak
+    footprint_end_mb: 2612.4
+    footprint_drift_mb: -1241.5    # settled below start; heartbeats flat ~2656
+    footprint_heartbeat_mb: 2650..2656   # 24h, effectively zero drift
+    rss_start_kb: 3946420
+    rss_end_kb: 2675139            # note: macOS RSS overcounts shared Metal
+                                   # pages; phys_footprint is the leak signal
+    caffeinate: yes                # -s, prevents idle-sleep termination
+  reload_cycles_100:
+    metric: phys_footprint
+    baseline_mb: 3523.7
+    after_mb: 3535.4
+    leak_mb: 11.7                  # PASS (< 128MB gate)
+
+notes:
+  - "Per-request phys_footprint leak (~6MB/req) found and fixed before this
+    run: KV-buffer alloc in Reserve() and buffer release in
+    ~MetalSequenceState now drain inside @autoreleasepool (the engine
+    worker thread has no ambient pool). Verified flat over 1000
+    create+decode+destroy cycles, then confirmed by this 24h soak
+    (footprint flat, reload leak 11.7MB)."
+
+not_certified_reasons:
+  - no formal production security review of this build
+  - unsigned/un-notarized dev artifact path used for measurement
+    (Developer ID + notarization + Hardened Runtime pending, env-gated)
+  - single-host sample (one M4 Pro); no cross-host variance data
