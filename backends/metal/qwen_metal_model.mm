@@ -4,7 +4,9 @@
 
 #include "backends/metal/qwen_metal_model.h"
 
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -126,6 +128,19 @@ struct QwenMetalModel::Impl {
     size_t esz = sizeof(float);
     std::vector<uint16_t> embed_fp16;  // fp16 row source when fp16 mode
 
+    // Unified Memory admission (addendum §10): a runtime budget plus staged
+    // watermarks over the recommended working set. weight_bytes is the
+    // resident weight footprint; kv_committed tracks physical KV backing
+    // summed across live sequences. A NEW sequence is refused once
+    // projected usage crosses the soft watermark (load shedding); an
+    // EXISTING sequence's KV cannot grow past the hard watermark. Fractions
+    // and (for tests) the absolute budget are overridable by env var.
+    uint64_t um_budget = 0;   // bytes; 0 disables runtime enforcement
+    uint64_t weight_bytes = 0;
+    double um_soft = 0.80;
+    double um_hard = 0.92;
+    std::atomic<uint64_t> kv_committed{0};
+
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLCommandQueue> pf_queue = nil;  // prefill-only queue
@@ -235,9 +250,17 @@ namespace {
 // Bounded contiguous KV cache in unified memory (spec MVP §16).
 class MetalSequenceState final : public SequenceState {
 public:
+    struct UmBudget {
+        std::atomic<uint64_t>* committed = nullptr;  // shared, per-model
+        uint64_t budget = 0;        // 0 => runtime enforcement disabled
+        uint64_t weight_bytes = 0;
+        double soft = 0.80;
+        double hard = 0.92;
+    };
+
     static Status Create(id<MTLDevice> device, const QwenConfig& config,
                          uint32_t max_tokens, size_t esz,
-                         MPSDataType dt,
+                         MPSDataType dt, const UmBudget& um,
                          std::unique_ptr<MetalSequenceState>& out) {
         auto state =
             std::unique_ptr<MetalSequenceState>(new MetalSequenceState());
@@ -246,6 +269,7 @@ public:
         state->dt_ = dt;
         state->kv_stride_ = config.num_kv_heads * config.head_dim;
         state->max_tokens_ = max_tokens;
+        state->um_ = um;
         state->keys_.resize(config.num_layers);
         state->values_.resize(config.num_layers);
         // Lazy allocation: start small and grow on demand. The logical
@@ -274,6 +298,37 @@ public:
                              kCtxBucket);
         const size_t new_bytes = size_t(grown) * kv_stride_ * esz_;
         const size_t old_bytes = size_t(alloc_tokens_) * kv_stride_ * esz_;
+
+        // Unified Memory admission (addendum §10). delta is the added
+        // physical KV backing across all layers (k+v). The initial reserve
+        // of a fresh sequence (alloc_tokens_==0) is gated by the SOFT
+        // watermark — load shedding, so an over-budget arrival is refused
+        // before it displaces running work. Growth of a live sequence is
+        // gated by the HARD watermark, above which the engine must not push
+        // the device toward an OS-level eviction.
+        const uint64_t delta =
+            uint64_t(new_bytes - old_bytes) * 2 * keys_.size();
+        if (um_.budget > 0 && delta > 0) {
+            const uint64_t projected =
+                um_.weight_bytes + um_.committed->load() + delta;
+            const bool initial = (alloc_tokens_ == 0);
+            const double frac = initial ? um_.soft : um_.hard;
+            const uint64_t limit = uint64_t(double(um_.budget) * frac);
+            if (projected > limit) {
+                return Status(
+                    initial ? ErrorCode::kCapacityExhausted
+                            : ErrorCode::kGpuOom,
+                    initial ? "unified memory soft watermark: new sequence "
+                              "refused (load shedding)"
+                            : "unified memory hard watermark: KV growth "
+                              "refused",
+                    kComponent)
+                    .WithDetail("projected_bytes", int64_t(projected))
+                    .WithDetail("watermark_bytes", int64_t(limit))
+                    .WithDetail("budget_bytes", int64_t(um_.budget));
+            }
+        }
+
         __block bool oom = false;
         // Drain autoreleased Metal temporaries here: this runs on the
         // engine worker thread, which has no ambient pool, so buffers
@@ -306,6 +361,10 @@ public:
         }
         alloc_tokens_ = grown;
         kv_td_cache_.clear();  // views point at the old buffers
+        if (um_.committed != nullptr) {
+            um_.committed->fetch_add(delta, std::memory_order_relaxed);
+            committed_bytes_ += delta;
+        }
         return Status::Ok();
     }
 
@@ -354,6 +413,10 @@ public:
     // Metal's deferred autoreleases from -dealloc would otherwise
     // accumulate (~6MB per destroyed sequence).
     ~MetalSequenceState() {
+        if (um_.committed != nullptr && committed_bytes_ > 0) {
+            um_.committed->fetch_sub(committed_bytes_,
+                                     std::memory_order_relaxed);
+        }
         @autoreleasepool {
             kv_td_cache_.clear();
             for (auto& b : keys_) b = nil;
@@ -373,6 +436,8 @@ private:
     std::map<uint32_t, std::vector<MPSGraphTensorData*>> kv_td_cache_;
     size_t esz_ = sizeof(float);
     MPSDataType dt_ = MPSDataTypeFloat32;
+    UmBudget um_{};              // shared budget context (set in Create)
+    uint64_t committed_bytes_ = 0;  // this sequence's contribution
 };
 
 NSArray<NSNumber*>* Shape2(uint64_t a, uint64_t b) {
@@ -451,6 +516,22 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
                         .WithDetail("weight_bytes",
                                     int64_t(weight_bytes));
                 return result;
+            }
+
+            // Seed the runtime admission budget from the same working-set
+            // figure. Env overrides allow tuning and let tests exercise the
+            // watermarks without a multi-GB model.
+            impl.weight_bytes = weight_bytes;
+            impl.um_budget = impl.device.recommendedMaxWorkingSetSize;
+            if (const char* b =
+                    std::getenv("LYKURO_METAL_UM_BUDGET_BYTES")) {
+                impl.um_budget = std::strtoull(b, nullptr, 10);
+            }
+            if (const char* s = std::getenv("LYKURO_METAL_UM_SOFT")) {
+                impl.um_soft = std::atof(s);
+            }
+            if (const char* h = std::getenv("LYKURO_METAL_UM_HARD")) {
+                impl.um_hard = std::atof(h);
             }
         }
 
@@ -701,12 +782,24 @@ QwenMetalModel::LoadResult QwenMetalModel::Load(
 Status QwenMetalModel::CreateSequence(uint32_t max_tokens,
                                       std::unique_ptr<SequenceState>& out) {
     std::unique_ptr<MetalSequenceState> state;
+    MetalSequenceState::UmBudget um;
+    um.committed = &impl_->kv_committed;
+    um.budget = impl_->um_budget;
+    um.weight_bytes = impl_->weight_bytes;
+    um.soft = impl_->um_soft;
+    um.hard = impl_->um_hard;
     Status s = MetalSequenceState::Create(impl_->device, config_,
                                           max_tokens, impl_->esz,
-                                          impl_->dt, state);
+                                          impl_->dt, um, state);
     if (!s.ok()) return s;
     out = std::move(state);
     return Status::Ok();
+}
+
+uint64_t QwenMetalModel::UmBudgetBytes() const { return impl_->um_budget; }
+uint64_t QwenMetalModel::UmWeightBytes() const { return impl_->weight_bytes; }
+uint64_t QwenMetalModel::UmCommittedKvBytes() const {
+    return impl_->kv_committed.load(std::memory_order_relaxed);
 }
 
 Status QwenMetalModel::ForwardToken(uint32_t token, uint32_t pos,

@@ -30,7 +30,7 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | Core/Data/Control API backward compat | ✅ | no API change; same proto |
 | Metal Backend interface + implementation | ✅ | `backends/metal` |
 | Apple Silicon device/capability checks | ✅ | `InspectMetalDevice` |
-| Unified Memory budget/watermark/admission | ◑ | load-time budget admission; staged watermarks pending |
+| Unified Memory budget/watermark/admission | ✅ | load-time weight admission + runtime staged watermarks (soft sheds new sequences, hard caps KV growth); committed-KV accounting; 3 tests |
 | model/metallib/package signature verification | ◑ | model+package signed; metallib N/A (MPSGraph-only) |
 | MVP operator/prefill/decode/sampling/stream | ✅ | oracle 3/3 on M4 Pro |
 | Scheduler/KV/cancel/deadline | ✅ | shared common core |

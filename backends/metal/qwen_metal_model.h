@@ -58,6 +58,14 @@ public:
     Status Decode(SequenceState& state, uint32_t token,
                   std::vector<float>& logits) override;
 
+    // Unified Memory admission observability (addendum §10). Bytes.
+    // Budget is 0 when runtime enforcement is disabled. Committed is the
+    // live physical KV backing summed across sequences; it returns to the
+    // weight-only baseline as sequences are destroyed.
+    uint64_t UmBudgetBytes() const;
+    uint64_t UmWeightBytes() const;
+    uint64_t UmCommittedKvBytes() const;
+
 private:
     QwenMetalModel() = default;
 

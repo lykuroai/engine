@@ -4,7 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #include "backends/metal/metal_backend.h"
 #include "backends/metal/qwen_metal_model.h"
@@ -179,6 +183,135 @@ TEST_F(MetalParityTest, Fp16MatchesGreedyAndStaysClose) {
     run(a);
     run(b);
     EXPECT_EQ(a, b);
+}
+
+// Unified Memory staged watermarks (addendum §10). With the budget shrunk
+// via env so the tiny model's KV is meaningful, a new sequence is refused
+// at the SOFT watermark (load shedding) while committed KV is tracked and
+// released on destruction.
+TEST_F(MetalParityTest, UnifiedMemorySoftWatermarkShedsAndReleases) {
+    // Physical KV backing added by one fresh sequence's initial reserve.
+    QwenConfig cfg;
+    ASSERT_TRUE(QwenConfig::FromManifest(manifest_, cfg).ok());
+    const uint64_t kv_stride = uint64_t(cfg.num_kv_heads) * cfg.head_dim;
+    const uint32_t initial = std::min<uint32_t>(128, 256);
+    const uint32_t grown = ((initial + 127) / 128) * 128;  // -> 128
+    const uint64_t delta = uint64_t(grown) * kv_stride * sizeof(float) *
+                           2 /*k+v*/ * cfg.num_layers;
+    const uint64_t weight = metal_->UmWeightBytes();
+    ASSERT_GT(weight, 0u);
+    ASSERT_GT(delta, 0u);
+
+    // Size the budget so the soft watermark (0.80) admits exactly two
+    // sequences: 0.80*budget == weight + 2.5*delta.
+    const double soft = 0.80;
+    const uint64_t budget =
+        uint64_t(std::ceil((double(weight) + 2.5 * double(delta)) / soft));
+    setenv("LYKURO_METAL_UM_BUDGET_BYTES",
+           std::to_string(budget).c_str(), 1);
+    setenv("LYKURO_METAL_UM_SOFT", "0.80", 1);
+    setenv("LYKURO_METAL_UM_HARD", "0.92", 1);
+    auto guarded = QwenMetalModel::Load(manifest_, file_);
+    unsetenv("LYKURO_METAL_UM_BUDGET_BYTES");
+    unsetenv("LYKURO_METAL_UM_SOFT");
+    unsetenv("LYKURO_METAL_UM_HARD");
+    ASSERT_TRUE(guarded.status.ok()) << guarded.status.message();
+    auto& m = *guarded.model;
+    EXPECT_EQ(m.UmBudgetBytes(), budget);
+    EXPECT_EQ(m.UmCommittedKvBytes(), 0u);
+
+    std::vector<std::unique_ptr<SequenceState>> live;
+    Status last;
+    for (int i = 0; i < 64; ++i) {
+        std::unique_ptr<SequenceState> st;
+        last = m.CreateSequence(128, st);
+        if (last.ok()) {
+            live.push_back(std::move(st));
+        } else {
+            break;
+        }
+    }
+    EXPECT_EQ(live.size(), 2u) << "soft watermark should admit exactly two";
+    EXPECT_EQ(last.code(), ErrorCode::kCapacityExhausted);
+    EXPECT_EQ(m.UmCommittedKvBytes(), 2 * delta);
+
+    // Destroying sequences returns the committed KV to baseline, and a new
+    // sequence is admitted again.
+    live.clear();
+    EXPECT_EQ(m.UmCommittedKvBytes(), 0u);
+    std::unique_ptr<SequenceState> after;
+    EXPECT_TRUE(m.CreateSequence(128, after).ok());
+    EXPECT_EQ(m.UmCommittedKvBytes(), delta);
+}
+
+// The HARD watermark caps growth of a LIVE sequence: the initial reserve
+// is admitted (soft), but growing the KV to a larger context bucket during
+// prefill is refused rather than pushing the device toward eviction.
+TEST_F(MetalParityTest, UnifiedMemoryHardWatermarkCapsGrowth) {
+    // A model with room for 3 context buckets so KV can actually grow.
+    testutil::TinyModelSpec spec;
+    spec.vocab_size = 303;
+    spec.eos_token_id = 302;
+    spec.max_context_tokens = 384;
+    ModelManifest manifest = testutil::MakeTinyManifest(spec);
+    std::string path =
+        testutil::WriteTinyWeights(spec, "metal_hard_wm.safetensors");
+    SafetensorsFile file;
+    ASSERT_TRUE(file.Open(path).ok());
+
+    QwenConfig cfg;
+    ASSERT_TRUE(QwenConfig::FromManifest(manifest, cfg).ok());
+    const uint64_t kv_stride = uint64_t(cfg.num_kv_heads) * cfg.head_dim;
+    const uint64_t f = sizeof(float) * 2 /*k+v*/ * cfg.num_layers;
+    const uint64_t di = uint64_t(256) * kv_stride * f;  // initial reserve
+    const uint64_t dg = uint64_t(128) * kv_stride * f;  // 256 -> 384 grow
+
+    auto probe = QwenMetalModel::Load(manifest, file);
+    ASSERT_TRUE(probe.status.ok()) << probe.status.message();
+    const uint64_t weight = probe.model->UmWeightBytes();
+
+    // Budget = full footprint. soft(0.99) admits weight+di; hard(0.90)
+    // refuses weight+di+dg.
+    const uint64_t budget = weight + di + dg;
+    setenv("LYKURO_METAL_UM_BUDGET_BYTES",
+           std::to_string(budget).c_str(), 1);
+    setenv("LYKURO_METAL_UM_SOFT", "0.99", 1);
+    setenv("LYKURO_METAL_UM_HARD", "0.90", 1);
+    auto guarded = QwenMetalModel::Load(manifest, file);
+    unsetenv("LYKURO_METAL_UM_BUDGET_BYTES");
+    unsetenv("LYKURO_METAL_UM_SOFT");
+    unsetenv("LYKURO_METAL_UM_HARD");
+    ASSERT_TRUE(guarded.status.ok()) << guarded.status.message();
+    auto& m = *guarded.model;
+
+    std::unique_ptr<SequenceState> st;
+    ASSERT_TRUE(m.CreateSequence(384, st).ok());  // initial reserve admitted
+    EXPECT_EQ(m.UmCommittedKvBytes(), di);
+
+    // Prefill past the first two buckets forces growth to bucket 384.
+    std::vector<uint32_t> prompt(260, 1);
+    std::vector<float> logits;
+    Status grow = m.Prefill(*st, prompt, logits);
+    EXPECT_EQ(grow.code(), ErrorCode::kGpuOom)
+        << "hard watermark should refuse KV growth";
+    // Committed unchanged by the refused growth.
+    EXPECT_EQ(m.UmCommittedKvBytes(), di);
+
+    std::remove(path.c_str());
+}
+
+// With no budget override the runtime budget is the (large) device working
+// set, so ordinary multi-sequence load is never falsely shed.
+TEST_F(MetalParityTest, UnifiedMemoryDefaultBudgetDoesNotFalselyShed) {
+    std::vector<std::unique_ptr<SequenceState>> live;
+    for (int i = 0; i < 8; ++i) {
+        std::unique_ptr<SequenceState> st;
+        ASSERT_TRUE(metal_->CreateSequence(128, st).ok());
+        live.push_back(std::move(st));
+    }
+    EXPECT_GT(metal_->UmCommittedKvBytes(), 0u);
+    live.clear();
+    EXPECT_EQ(metal_->UmCommittedKvBytes(), 0u);
 }
 
 // Engine integration on Metal (addendum Phase 2): streaming order,
