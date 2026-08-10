@@ -76,6 +76,8 @@ jobs:
         env:
           LYKURO_TEST_DEVICE: "0"
         run: ctest --test-dir build/cuda --output-on-failure
+      - name: Self-contained binary gate
+        run: ./tools/check_selfcontained.sh build/cuda/cmd/native-engine/native-engine
 
   # Metal integration/golden + real-model oracle. Self-hosted Apple
   # Silicon runner; manual only.
@@ -84,11 +86,13 @@ jobs:
     runs-on: [self-hosted, macos, arm64]
     steps:
       - uses: actions/checkout@v4
-      - name: Configure (Metal + gRPC)
-        run: >
-          cmake -S . -B build/metal -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DLYKURO_ENABLE_METAL=ON -DLYKURO_ENABLE_GRPC=ON
+      # The runner must have the static gRPC toolchain prebuilt once:
+      #   third_party/build_grpc_static.sh ~/.local/grpc-static
+      - name: Configure (Metal + gRPC, single static binary)
+        run: cmake --preset release-static
       - name: Build
-        run: cmake --build build/metal -j
+        run: cmake --build build/release-static -j
+      - name: Self-contained binary gate
+        run: ./tools/check_selfcontained.sh build/release-static/cmd/native-engine/native-engine
       - name: Test
-        run: ctest --test-dir build/metal --output-on-failure
+        run: ctest --test-dir build/release-static --output-on-failure

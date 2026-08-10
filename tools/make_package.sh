@@ -72,6 +72,11 @@ if [[ "$PROFILE" == macos-metal ]]; then
     "$ROOT/deploy/macos/sign_and_notarize.sh" "${SIGN_ARGS[@]}" "$STAGE"
 fi
 
+# Self-contained gate (spec §0.2/§23.2): fail closed if any staged binary
+# pulled in a forbidden dynamic dependency (Homebrew / non-static
+# grpc/protobuf/abseil). Guards the single-binary guarantee.
+"$ROOT/tools/check_selfcontained.sh" "$STAGE"/bin/*
+
 # Per-file checksums (sorted for determinism).
 ( cd "$STAGE" && find . -type f ! -name checksums.sha256 -print0 \
     | sort -z | xargs -0 shasum -a 256 > checksums.sha256 )
