@@ -32,14 +32,29 @@
         "LYKURO_ENABLE_CUDA": "ON",
         "LYKURO_ENABLE_GRPC": "ON"
       }
+    },
+    {
+      "name": "release-static",
+      "displayName": "Release, single static binary (macOS Metal; static gRPC/OpenSSL)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/release-static",
+      "cacheVariables": {
+        "LYKURO_ENABLE_METAL": "ON",
+        "LYKURO_ENABLE_GRPC": "ON",
+        "CMAKE_PREFIX_PATH": "$env{HOME}/.local/grpc-static",
+        "OPENSSL_ROOT_DIR": "/opt/homebrew/opt/openssl",
+        "OPENSSL_USE_STATIC_LIBS": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "release-static", "configurePreset": "release-static" }
   ],
   "testPresets": [
     { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "release-static", "configurePreset": "release-static", "output": { "outputOnFailure": true } }
   ]
 }
