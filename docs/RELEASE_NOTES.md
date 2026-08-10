@@ -1,6 +1,6 @@
 # Release Notes
 
-## v1.0.0 (2026-08-08)
+## v1.0.0 (2026-08-11)
 
 First release of the Lykuro Native Inference Engine — a from-scratch
 local LLM inference engine with no third-party inference runtime, per
@@ -29,9 +29,17 @@ LYK-NIE-SD-001 and the Metal addendum LYK-NIE-ADD-METAL-001.
   separation, Ed25519 manifest signature verification (fail-closed),
   content-free logs/metrics, loopback metrics endpoint, and a strict
   fail-closed JSON config.
-- **Stability.** Per-request bookkeeping is bounded by in-flight work; a
-  600s mixed-load soak and 100 unload/reload cycles ran leak-free (24h
-  CUDA soak in progress).
+- **Stability — both 24h soaks passed.** CUDA: 237,009 requests, 0 failed,
+  RSS bit-identical, 100 reload cycles leak-free. Metal: 137,440 completed,
+  0 failed, phys_footprint flat (~2656MB over 24h) after fixing a
+  per-request autorelease leak; 100 reload cycles leak 11.7MB. Per-request
+  bookkeeping is bounded by in-flight work.
+- **Unified Memory admission (Metal).** Load-time weight admission plus
+  runtime staged watermarks — soft sheds new sequences, hard caps KV
+  growth — with committed-KV accounting.
+- **Supply-chain gate.** `tools/scan_vulnerabilities.sh` cross-checks the
+  SBOM against a VEX ledger and OSV, fails closed on unreviewed deps or
+  un-waived CRITICAL/HIGH; emits `vulnerability-report.json` in CI.
 
 ### Packaging
 
@@ -39,16 +47,31 @@ LYK-NIE-SD-001 and the Metal addendum LYK-NIE-ADD-METAL-001.
   staged tree, sorted checksums, provenance manifest, Ed25519-signed
   manifest, deterministic tarball. SBOM (SPDX 2.3) and full license
   texts included.
+- **Single self-contained binary.** gRPC/protobuf/abseil/OpenSSL are
+  statically linked (`release-static` preset, `third_party/build_grpc_static.sh`);
+  macOS links only `/usr/lib` + Apple frameworks, Linux the C/C++ runtime
+  + system OpenSSL + CUDA. A cross-platform gate
+  (`tools/check_selfcontained.sh`) fails the build on any forbidden dynamic
+  dependency.
+- **macOS install (§24).** pre/postinstall prechecks, `enable_service.sh`
+  (non-root `_lykuro` LaunchDaemon), and `uninstall.sh`. Two-phase signing:
+  Phase 1 `--dev` ad-hoc (internal test), Phase 2 Developer ID + notarize.
+- **Operations runbook** (`docs/operations/runbook.md`): deploy, monitor,
+  Drain/Resume update, versioned-package rollback, recovery.
 
 ### Known limitations / not certified
 
-- Certified Profiles are **dev-measured**, not production-certified: 24h
-  Metal soak, formal security review, and signed-artifact-only
-  measurement are pending.
-- macOS package signing (Developer ID) and notarization are deferred
-  (no credentials in the build environment); custom Metal kernels
-  (precompiled `metallib`) require an Xcode CI runner — the MVP is
-  MPSGraph-only.
+- **This is a pre-release.** Public signed binaries are not attached:
+  macOS Developer ID signing + Apple notarization (Phase 2,
+  downloads.lykuro.ai) await Apple Developer Program enrollment. The
+  sign/notarize/staple pipeline is implemented and self-skipping until the
+  certificate is present. Build from source with the `release-static`
+  preset, or use the internal Phase 1 `--dev` ad-hoc package.
+- Certified Profiles are **dev-measured**, not production-certified:
+  formal security review, signed-artifact-only measurement, and
+  cross-host variance data are pending (the 24h soaks themselves passed).
+- Custom Metal kernels (precompiled `metallib`) require an Xcode CI
+  runner — the MVP is MPSGraph-only.
 - Hardware/OS coverage is limited to the entries in
   `docs/compatibility-matrix.md`. Sharded weights, MoE, embeddings,
   vision, and NCCL-based multi-GPU are out of scope for this release.
