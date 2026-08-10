@@ -39,6 +39,25 @@ jobs:
       - name: Test
         run: ctest --test-dir build/ci --output-on-failure
 
+  # CVE gate (spec §33 vuln report / DoD item 4). Cross-checks every SBOM
+  # dependency against the VEX ledger (fail-closed on inventory) and the
+  # OSV database, and fails on un-waived CRITICAL/HIGH findings. Runs on
+  # every push/PR; publishes vulnerability-report.json as an artifact.
+  vuln-scan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install scanner deps
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+      - name: CVE gate (SBOM x VEX ledger x OSV)
+        run: ./tools/scan_vulnerabilities.sh --report vulnerability-report.json
+      - name: Publish vulnerability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-report
+          path: vulnerability-report.json
+
   # CUDA integration/golden/parity + soak. Self-hosted GPU runner; manual
   # only so it never blocks a PR and never contends with a running soak.
   cuda:

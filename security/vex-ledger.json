@@ -1,0 +1,70 @@
+{
+  "schema": "lykuro.vex/1",
+  "comment": "VEX-style review ledger for the Lykuro Native Inference Engine. The CVE gate (tools/scan_vulnerabilities.sh) is FAIL-CLOSED on inventory: every package in sbom/lykuro-native-engine.spdx.json must have a matching entry here or CI fails. For components with an authoritative OSV mapping, findings are fetched live from api.osv.dev and gated per policy; only findings whose severity is in policy.gate_severity block, and only when not covered by a waiver. Waivers are acknowledgements with a remediation action + due date, NOT a claim the issue is harmless. Native C/C++ libraries built from source (grpc++, libprotobuf) are 'vendor_tracked' rather than OSV-gated: language-ecosystem OSV proxies (Go/PyPI) describe the Go/Python implementations, not the C++ builds this engine links, so gating on them would produce false blockers. Those are reviewed manually against the upstream advisory feed.",
+  "policy": {
+    "gate_severity": ["CRITICAL", "HIGH"],
+    "osv_endpoint": "https://api.osv.dev",
+    "fail_on_unreviewed_dependency": true,
+    "fail_on_expired_waiver": true,
+    "fail_on_untriaged_gated_finding": true
+  },
+  "components": [
+    {
+      "sbom_name": "lykuro-native-engine",
+      "disposition": "first_party",
+      "osv": null,
+      "justification": "First-party engine (core, scheduler, KV, model plugin, backends, API, security). No external advisory feed; covered by internal review, unit/golden/integration/security tests, and the no-forbidden-runtime CI gate."
+    },
+    {
+      "sbom_name": "CUDA Toolkit (cudart)",
+      "disposition": "vendor_tracked",
+      "osv": null,
+      "vendor_advisories": "https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/ and NVIDIA Product Security (psirt)",
+      "justification": "Linux profile only. Closed-source vendor SDK; not represented in OSV by version. Runtime link limited to CUDA::cudart (cuBLAS removed in Phase 4). Reviewed manually against NVIDIA PSIRT bulletins at release cut."
+    },
+    {
+      "sbom_name": "gRPC (grpc++)",
+      "disposition": "vendor_tracked",
+      "osv": null,
+      "vendor_advisories": "https://github.com/grpc/grpc/security/advisories",
+      "justification": "Built from source (1.66.2) as the internal mTLS API transport. The grpc/grpc C++ core has no clean OSV ecosystem; the Go module (google.golang.org/grpc) advisories in OSV describe the Go implementation and do not apply to this C++ build. Reviewed manually against grpc/grpc GHSA advisories at release cut."
+    },
+    {
+      "sbom_name": "Protocol Buffers (libprotobuf)",
+      "disposition": "vendor_tracked",
+      "osv": null,
+      "vendor_advisories": "https://github.com/protocolbuffers/protobuf/security/advisories",
+      "justification": "Built from source (27.2 Linux / 35.1 macOS) for API-contract encoding. The C++ libprotobuf has no clean OSV ecosystem; PyPI 'protobuf' advisories describe the pure-Python parser and do not apply to this C++ build. Reviewed manually against protocolbuffers/protobuf GHSA advisories at release cut."
+    },
+    {
+      "sbom_name": "OpenSSL (libcrypto)",
+      "disposition": "osv_gated",
+      "osv": { "name": "openssl", "ecosystem": "Ubuntu:22.04", "version": "3.0.2-0ubuntu1.12" },
+      "deployed_version": "3.0.2-0ubuntu1.12",
+      "justification": "System libssl3 on the Linux deploy host (Ubuntu 22.04). Authoritatively tracked via the Ubuntu:22.04 OSV ecosystem. Engine usage: Ed25519 manifest signature verification and internal mTLS (Manager/Gateway on a private network; no public-internet TLS termination and no PKCS#7/S-MIME processing).",
+      "waivers": [
+        {
+          "id": "UBUNTU-CVE-2026-45447",
+          "status": "under_remediation",
+          "severity": "HIGH",
+          "action": "Upgrade host libssl3/openssl to 3.0.2-0ubuntu1.25 (jammy-security), which carries the fix.",
+          "exposure": "Use-after-free in PKCS#7/S-MIME signature verification. The engine does not parse PKCS#7 or S-MIME messages (Ed25519 raw verify + TLS handshake only), so the vulnerable code path is not exercised; upgrade is tracked to remove residual risk.",
+          "due": "2026-09-01"
+        }
+      ]
+    },
+    {
+      "sbom_name": "Apple Metal / MetalPerformanceShaders / MPSGraph",
+      "disposition": "vendor_tracked",
+      "osv": null,
+      "vendor_advisories": "https://support.apple.com/en-us/HT201222 (Apple security releases)",
+      "justification": "macOS profile only. OS-managed system frameworks (Foundation, Metal, MetalPerformanceShaders, MetalPerformanceShadersGraph); patched via macOS updates, not vendored. Not represented in OSV by version. Reviewed against Apple security releases at release cut."
+    },
+    {
+      "sbom_name": "GoogleTest",
+      "disposition": "not_shipped",
+      "osv": null,
+      "justification": "TEST/DEV ONLY. Never linked into a production artifact (absent from release packages; see SBOM DEV_DEPENDENCY_OF relationship). Out of scope for the production CVE gate."
+    }
+  ]
+}

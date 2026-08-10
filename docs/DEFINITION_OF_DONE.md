@@ -41,7 +41,7 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | unit/golden/integration/security/perf/soak results | ✅ | 176/176 tests green; 24h Metal soak PASSED (137440 completed, 0 failed, footprint flat ~2656MB, 100 reload cycles leak 11.7MB) |
 | Mac mini M4 64GB Certified Profile (measured) | ◑ | dev-measured profile issued: `cp_qwen25_05b_m4pro_dev1.yaml` (incl. 24h soak); formal/cross-host cert pending |
 | install/monitor/update/rollback/recovery docs | ◑ | scaffolding in `deploy/macos` |
-| SBOM/provenance/license/vuln report | ✅ | shared SBOM; vuln scan is a CI gate |
+| SBOM/provenance/license/vuln report | ✅ | shared SBOM; CVE gate `tools/scan_vulnerabilities.sh` (SBOM×VEX ledger×OSV) wired in CI, emits `vulnerability-report.json` |
 | Unimplemented/unverified/underperformance documented | ✅ | README + this file |
 
 ## Remaining before production sign-off
@@ -56,4 +56,11 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 2. macOS Developer ID signing + Apple notarization + Gatekeeper test.
 3. Formal Certified Profile issuance from a signed-artifact-only,
    security-reviewed build.
-4. CVE scan wired as a hard CI gate producing `vulnerability-report.json`.
+4. ~~CVE scan wired as a hard CI gate producing `vulnerability-report.json`~~
+   ✅ done — `vuln-scan` job runs `tools/scan_vulnerabilities.sh` on every
+   push/PR: fail-closed on unreviewed deps (SBOM×`security/vex-ledger.json`),
+   OSV cross-check, blocks un-waived CRITICAL/HIGH. Current state: 1 HIGH
+   (OpenSSL `UBUNTU-CVE-2026-45447`, PKCS#7 UAF) tracked under a time-bound
+   `under_remediation` waiver — host libssl3 upgrade to 3.0.2-0ubuntu1.25
+   due 2026-09-01; engine does not exercise the PKCS#7 path. The residual
+   waiver is what keeps the human security review (item 3) open.
