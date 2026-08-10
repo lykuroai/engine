@@ -40,7 +40,7 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | Developer ID sign, notarization, Hardened Runtime | ◑ | two-phase: Phase 1 `--dev` ad-hoc sign + self-contained dylib bundle produces a runnable internal package today (verified: extracts to a fresh host and runs, 0 Homebrew refs); Phase 2 (downloads.lykuro.ai) full Developer ID + notarization pipeline implemented + wired, awaits the cert |
 | unit/golden/integration/security/perf/soak results | ✅ | 176/176 tests green; 24h Metal soak PASSED (137440 completed, 0 failed, footprint flat ~2656MB, 100 reload cycles leak 11.7MB) |
 | Mac mini M4 64GB Certified Profile (measured) | ◑ | dev-measured profile issued: `cp_qwen25_05b_m4pro_dev1.yaml` (incl. 24h soak); formal/cross-host cert pending |
-| install/monitor/update/rollback/recovery docs | ✅ | `deploy/macos` scaffolding + `docs/operations/runbook.md` (install layout, Drain/Resume update, versioned-package rollback, recovery table) |
+| install/monitor/update/rollback/recovery docs | ✅ | `deploy/macos` pre/postinstall + enable_service/uninstall (§24) + `docs/operations/runbook.md` (install layout, Drain/Resume update, versioned-package rollback, recovery table) |
 | SBOM/provenance/license/vuln report | ✅ | shared SBOM; CVE gate `tools/scan_vulnerabilities.sh` (SBOM×VEX ledger×OSV) wired in CI, emits `vulnerability-report.json` |
 | Unimplemented/unverified/underperformance documented | ✅ | README + this file |
 

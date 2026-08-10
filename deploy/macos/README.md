@@ -114,6 +114,35 @@ user. When the Gateway/Platform runs in a container, it reaches the engine
 over a host-only mTLS connection — the engine port is never exposed to the
 public LAN (§23.4).
 
+## Install / enable / uninstall (§24)
+
+Both packages install to `/Library/Application Support/Lykuro/NativeEngine`
+(the LaunchDaemon's path). The `.pkg` runs a fail-closed **preinstall**
+precheck (Apple Silicon, macOS 13+, free space) and a **postinstall** that
+lays down runtime dirs — but deliberately does **not** start the service
+(it has no secrets/config yet). Activation is an explicit operator step:
+
+```
+# 1. install (dev pkg shown; Phase 2 pkg is identical flow)
+sudo installer -pkg lykuro-native-engine-macos-metal-<ver>-dev-adhoc.pkg -target /
+# 2. place secrets + config
+sudo cp server.crt server.key client-ca.crt \
+  "/Library/Application Support/Lykuro/NativeEngine/secrets/"
+sudo cp engine.json "/Library/Application Support/Lykuro/NativeEngine/config/"
+# 3. create the _lykuro service user + load the daemon
+sudo "/Library/Application Support/Lykuro/NativeEngine/enable_service.sh"
+```
+
+Uninstall preserves operator data by default; `--purge` removes secrets,
+the model store, and the `_lykuro` user:
+
+```
+sudo "/Library/Application Support/Lykuro/NativeEngine/uninstall.sh"          # keep data
+sudo "/Library/Application Support/Lykuro/NativeEngine/uninstall.sh" --purge  # remove all
+```
+
+See `docs/operations/runbook.md` for update/rollback/recovery.
+
 ## Not yet implemented (credential- or toolchain-gated)
 
 - Running the sign/notarize pipeline for real (needs the Developer ID cert
@@ -121,4 +150,3 @@ public LAN (§23.4).
 - `lykuro.metallib` precompile (needs Xcode's `metal` compiler; the MVP
   runs MPSGraph-only, so no custom metallib is required yet)
 - YAML config parsing (loader is JSON today; this YAML documents the shape)
-- installer precheck/uninstall flows (§24)
