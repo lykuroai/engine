@@ -51,6 +51,15 @@ if [[ "$PROFILE" == macos-metal ]]; then
     cp deploy/macos/engine.example.yaml "$STAGE/config/"
 fi
 
+# macOS Developer ID: codesign the Mach-O binaries with Hardened Runtime
+# BEFORE checksums, so the tarball and the Ed25519 manifest signature cover
+# the signed binaries. Self-skips when DEVELOPER_ID_APP is unset (dev
+# posture). The notarized .pkg is produced by the full pipeline (run
+# deploy/macos/sign_and_notarize.sh "$STAGE" after this script).
+if [[ "$PROFILE" == macos-metal ]]; then
+    "$ROOT/deploy/macos/sign_and_notarize.sh" --codesign-only "$STAGE"
+fi
+
 # Per-file checksums (sorted for determinism).
 ( cd "$STAGE" && find . -type f ! -name checksums.sha256 -print0 \
     | sort -z | xargs -0 shasum -a 256 > checksums.sha256 )
