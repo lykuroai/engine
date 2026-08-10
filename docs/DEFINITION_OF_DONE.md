@@ -35,9 +35,9 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | MVP operator/prefill/decode/sampling/stream | ✅ | oracle 3/3 on M4 Pro |
 | Scheduler/KV/cancel/deadline | ✅ | shared common core |
 | Platform/Model Manager integration | ✅ | gRPC serving e2e |
-| No Python/Node/Homebrew/Xcode in production | ✅ | host-native binary + frameworks |
+| No Python/Node/Homebrew/Xcode in production | ✅ | host-native binary + frameworks; macOS package bundles all non-system dylibs into lib/ (@rpath), fail-closed on residual /opt/homebrew refs |
 | No third-party inference server | ✅ | same CI gate |
-| Developer ID sign, notarization, Hardened Runtime | ◑ | two-phase: Phase 1 `--dev` ad-hoc sign (Hardened Runtime, no Developer Program) works today for internal test; Phase 2 (downloads.lykuro.ai) full Developer ID + notarization pipeline implemented + wired, awaits the cert |
+| Developer ID sign, notarization, Hardened Runtime | ◑ | two-phase: Phase 1 `--dev` ad-hoc sign + self-contained dylib bundle produces a runnable internal package today (verified: extracts to a fresh host and runs, 0 Homebrew refs); Phase 2 (downloads.lykuro.ai) full Developer ID + notarization pipeline implemented + wired, awaits the cert |
 | unit/golden/integration/security/perf/soak results | ✅ | 176/176 tests green; 24h Metal soak PASSED (137440 completed, 0 failed, footprint flat ~2656MB, 100 reload cycles leak 11.7MB) |
 | Mac mini M4 64GB Certified Profile (measured) | ◑ | dev-measured profile issued: `cp_qwen25_05b_m4pro_dev1.yaml` (incl. 24h soak); formal/cross-host cert pending |
 | install/monitor/update/rollback/recovery docs | ◑ | scaffolding in `deploy/macos` |
