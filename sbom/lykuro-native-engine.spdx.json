@@ -37,14 +37,14 @@
     {
       "SPDXID": "SPDXRef-Package-grpc",
       "name": "gRPC (grpc++)",
-      "versionInfo": "1.66.2",
+      "versionInfo": "1.66.2 (Linux) / 1.83.0 (macOS)",
       "supplier": "Organization: gRPC authors / CNCF",
       "downloadLocation": "https://github.com/grpc/grpc",
       "licenseConcluded": "Apache-2.0",
       "licenseDeclared": "Apache-2.0",
       "copyrightText": "Copyright The gRPC Authors",
       "filesAnalyzed": false,
-      "comment": "Internal API transport (mTLS). Built from source against the system OpenSSL. Optional (LYKURO_ENABLE_GRPC)."
+      "comment": "Internal API transport (mTLS). Built from source (third_party/build_grpc_static.sh) and STATICALLY linked into the single self-contained engine binary, together with its vendored abseil/protobuf/re2/c-ares/zlib. macOS pins 1.83.0 (1.66.2's vendored abseil mis-emits -msse4.1 on arm64 under Apple clang 21); Linux pins 1.66.2. Optional (LYKURO_ENABLE_GRPC)."
     },
     {
       "SPDXID": "SPDXRef-Package-protobuf",

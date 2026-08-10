@@ -11,6 +11,30 @@ thing missing is the certificate + Apple notarization account. This
 directory also holds the environment-independent pieces: the launchd
 definition, the example config, the package layout, and the install docs.
 
+## Single self-contained binary (linkage)
+
+The production build is **one executable per program, no dylib directory**.
+`native-engine` links only OS-provided libraries and Apple frameworks
+(`/usr/lib/libSystem`, `libc++`, `libobjc`, CoreFoundation, Foundation,
+Metal, MetalPerformanceShaders, MetalPerformanceShadersGraph) — verified
+with `otool -L`. gRPC/protobuf/abseil/OpenSSL are **statically linked**.
+
+- Build the static toolchain once: `third_party/build_grpc_static.sh`
+  (source-builds gRPC + vendored deps + static OpenSSL to `~/.local/grpc-static`).
+- Configure/build with the `release-static` preset:
+  `cmake --preset release-static && cmake --build build/release-static`.
+- Package from that build dir: `make_package.sh build/release-static macos-metal dist`.
+
+This matches the Linux build, which already static-links the third-party
+stack (grpc/protobuf/abseil) and leaves only system OpenSSL (apt-managed,
+so OS CVE fixes apply without a rebuild) and the CUDA runtime dynamic.
+macOS has no OS-managed OpenSSL, so it static-links OpenSSL instead.
+
+> `deploy/macos/bundle_dylibs.sh` remains as a **fallback** for a
+> non-static (Homebrew-linked) build: it vendors dylibs into `lib/` and
+> rewrites to `@rpath`. Against a `release-static` build it finds nothing
+> to bundle (0 dylibs) and is a no-op.
+
 ## Two-phase distribution
 
 | Phase | Audience | Signing | Command |
