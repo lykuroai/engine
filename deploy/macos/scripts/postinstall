@@ -1,0 +1,32 @@
+#!/bin/bash
+# pkg postinstall — lay down runtime dirs and permissions (addendum §24).
+# Runs as root after the payload is written to INSTALL_ROOT.
+#
+# Deliberately does NOT create the service user, load the LaunchDaemon, or
+# start the engine: the service needs operator-provided secrets/config
+# first, and auto-starting would crash-loop. Service activation is an
+# explicit step (deploy/macos/enable_service.sh), so a fresh install is
+# inert and fail-safe until configured.
+set -u
+
+INSTALL_ROOT="/Library/Application Support/Lykuro/NativeEngine"
+LOG_DIR="/Library/Logs/Lykuro/NativeEngine"
+
+/bin/mkdir -p "$INSTALL_ROOT/config" "$INSTALL_ROOT/secrets" "$LOG_DIR"
+
+# Secrets dir must not be world-readable even before the service user
+# exists (root-owned, 0700 until enable_service.sh re-chowns to _lykuro).
+/bin/chmod 700 "$INSTALL_ROOT/secrets"
+/bin/chmod 755 "$LOG_DIR"
+
+echo "postinstall: files at $INSTALL_ROOT"
+cat <<EOF
+postinstall: install complete (service NOT started — fail-safe).
+  Next:
+    1. Place mTLS material in $INSTALL_ROOT/secrets/ and config in
+       $INSTALL_ROOT/config/engine.json
+    2. Activate the service:
+       sudo /Library/Application\\ Support/Lykuro/NativeEngine/enable_service.sh
+    3. Verify per docs/operations/runbook.md (§3).
+EOF
+exit 0

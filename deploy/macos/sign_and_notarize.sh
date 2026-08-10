@@ -46,6 +46,10 @@ OUT_DIR="${2:-$(dirname "$STAGE")}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENTITLEMENTS="$ROOT/deploy/macos/entitlements.plist"
 PKG_IDENTIFIER="${PKG_IDENTIFIER:-ai.lykuro.native-engine}"
+# Canonical install root — matches the LaunchDaemon plist (§23.3). Both the
+# dev and release packages install here so there is one service layout.
+INSTALL_LOCATION="/Library/Application Support/Lykuro/NativeEngine"
+PKG_SCRIPTS="$ROOT/deploy/macos/scripts"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "ERROR: Developer ID signing must run on macOS" >&2; exit 2
@@ -118,8 +122,8 @@ if [[ "$DEV_MODE" -eq 1 ]]; then
   # downloaded copy; internal testers clear it once per host.
   DEVPKG="$OUT_DIR/${VERSION_BASENAME}-dev-adhoc.pkg"
   pkgbuild --root "$STAGE" --identifier "$PKG_IDENTIFIER" \
-    --version "$VERSION" \
-    --install-location "/usr/local/lykuro-native-engine" "$DEVPKG"
+    --version "$VERSION" --scripts "$PKG_SCRIPTS" \
+    --install-location "$INSTALL_LOCATION" "$DEVPKG"
   cat <<EOF
 OK: ad-hoc dev package -> $DEVPKG
     Internal install: sudo installer -pkg "$DEVPKG" -target /
@@ -139,7 +143,8 @@ PKG_SIGNED="$OUT_DIR/${VERSION_BASENAME}.pkg"
 pkgbuild --root "$STAGE" \
   --identifier "$PKG_IDENTIFIER" \
   --version "$VERSION" \
-  --install-location "/usr/local/lykuro-native-engine" \
+  --scripts "$PKG_SCRIPTS" \
+  --install-location "$INSTALL_LOCATION" \
   "$PKG_UNSIGNED"
 
 if [[ -n "${DEVELOPER_ID_INSTALLER:-}" ]]; then

@@ -1,0 +1,46 @@
+#!/bin/bash
+# pkg preinstall — environment precheck (addendum §24). Runs as root inside
+# the installer BEFORE payload extraction. A non-zero exit aborts the
+# install cleanly, so an unsupported host never gets a half-written service.
+#
+# Checks: Apple Silicon, minimum macOS, free space, and (informational)
+# whether a prior install / running daemon is present (upgrade path).
+set -u
+
+INSTALL_ROOT="/Library/Application Support/Lykuro/NativeEngine"
+LABEL="ai.lykuro.native-engine"
+MIN_MAJOR=13            # macOS 13+ (Metal / MPSGraph baseline)
+MIN_FREE_MB=500
+
+fail() { echo "preinstall: $1" >&2; exit 1; }
+
+# 1. Apple Silicon only (the Metal build is arm64).
+arch="$(/usr/bin/uname -m)"
+[ "$arch" = "arm64" ] || fail "requires Apple Silicon (arm64); found $arch"
+
+# 2. Minimum macOS.
+ver="$(/usr/bin/sw_vers -productVersion 2>/dev/null)"
+major="${ver%%.*}"
+case "$major" in
+  ''|*[!0-9]*) fail "cannot determine macOS version";;
+esac
+[ "$major" -ge "$MIN_MAJOR" ] || fail "requires macOS $MIN_MAJOR+; found $ver"
+
+# 3. Free space on the target volume (best-effort).
+free_mb="$(/bin/df -m / 2>/dev/null | /usr/bin/awk 'NR==2{print $4}')"
+if [ -n "${free_mb:-}" ] && [ "$free_mb" -lt "$MIN_FREE_MB" ]; then
+  fail "insufficient free space: ${free_mb}MB < ${MIN_FREE_MB}MB"
+fi
+
+# 4. Upgrade detection (informational — do NOT stop the service here; the
+#    operator drains via the Control API per the runbook, and a running
+#    daemon is safely restarted by `launchctl kickstart` post-upgrade).
+if [ -x "$INSTALL_ROOT/bin/lykuro-native-engine" ]; then
+  echo "preinstall: existing install at $INSTALL_ROOT -> upgrade"
+fi
+if /bin/launchctl print "system/$LABEL" >/dev/null 2>&1; then
+  echo "preinstall: service $LABEL is loaded (will keep running until restart)"
+fi
+
+echo "preinstall: OK ($arch, macOS $ver, ${free_mb:-?}MB free)"
+exit 0

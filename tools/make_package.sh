@@ -49,6 +49,10 @@ if [[ "$PROFILE" == macos-metal ]]; then
     mkdir -p "$STAGE/launchd" "$STAGE/config"
     cp deploy/macos/ai.lykuro.native-engine.plist "$STAGE/launchd/"
     cp deploy/macos/engine.example.yaml "$STAGE/config/"
+    # Operator activation/removal scripts ship alongside the binary so they
+    # land at the install root (§24 install/uninstall flows).
+    cp deploy/macos/enable_service.sh deploy/macos/uninstall.sh "$STAGE/"
+    chmod +x "$STAGE/enable_service.sh" "$STAGE/uninstall.sh"
 fi
 
 # macOS Developer ID: codesign the Mach-O binaries with Hardened Runtime
