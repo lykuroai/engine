@@ -41,9 +41,11 @@ check_linux() {
   local bin="$1" deps bad
   deps="$(ldd "$bin" 2>/dev/null || true)"
   # Forbidden: the bundled-stack libraries, or any dep resolved from a
-  # non-system prefix (home/opt/local).
+  # non-system prefix (home/opt/local) — EXCEPT the CUDA/NVIDIA runtime,
+  # which legitimately lives under /usr/local/cuda and must stay dynamic.
   bad="$(printf '%s\n' "$deps" \
     | grep -iE 'libgrpc|libprotobuf|libabsl|libre2|libcares|libupb|=> (/home|/opt|/usr/local)/' \
+    | grep -viE 'cuda|nvidia' \
     || true)"
   if [ -n "$bad" ]; then
     echo "FAIL $bin — forbidden dynamic dependencies:" >&2
