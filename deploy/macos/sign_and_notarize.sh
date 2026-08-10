@@ -32,7 +32,14 @@
 set -euo pipefail
 
 CODESIGN_ONLY=0
-if [[ "${1:-}" == "--codesign-only" ]]; then CODESIGN_ONLY=1; shift; fi
+DEV_MODE=0
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --codesign-only) CODESIGN_ONLY=1; shift;;
+    --dev) DEV_MODE=1; shift;;      # ad-hoc sign, no Developer Program
+    *) echo "unknown flag: $1" >&2; exit 2;;
+  esac
+done
 
 STAGE="${1:?staged package dir (from make_package.sh)}"
 OUT_DIR="${2:-$(dirname "$STAGE")}"
@@ -45,12 +52,22 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 [[ -d "$STAGE/bin" ]] || { echo "ERROR: $STAGE has no bin/ (not a staged package?)" >&2; exit 2; }
 
-if [[ -z "${DEVELOPER_ID_APP:-}" ]]; then
+# Identity resolution — three postures:
+#   Developer ID set        -> full sign + notarize + staple (distribution)
+#   --dev (no Developer ID) -> ad-hoc sign + Hardened Runtime (internal test)
+#   neither                 -> no-op exit 0 (leave the tree unsigned)
+if [[ -n "${DEVELOPER_ID_APP:-}" ]]; then
+  SIGN_IDENTITY="$DEVELOPER_ID_APP"
+elif [[ "$DEV_MODE" -eq 1 ]]; then
+  SIGN_IDENTITY="-"                 # ad-hoc
+  echo "NOTICE: --dev: ad-hoc signing (Phase 1, no Apple Developer Program)."
+else
   cat >&2 <<'EOF'
-NOTICE: DEVELOPER_ID_APP not set -> signing/notarization SKIPPED.
-        The staged package remains unsigned (dev posture). To produce a
-        signed+notarized package, export the Developer ID identities and
-        notary credentials (see the header of this script) and re-run.
+NOTICE: no signing identity -> SKIPPED (tree left unsigned).
+        Phase 1 (internal test, no Developer Program): re-run with --dev
+          for an ad-hoc-signed package.
+        Phase 2 (downloads.lykuro.ai): export the Developer ID identities
+          and notary credentials (see this script's header) and re-run.
 EOF
   exit 0
 fi
@@ -62,20 +79,44 @@ command -v xcrun >/dev/null || { echo "ERROR: xcrun not found" >&2; exit 2; }
 VERSION_BASENAME="$(basename "$STAGE")"          # lykuro-native-engine-macos-metal-<ver>
 VERSION="${VERSION_BASENAME##*-}"
 
+# Ad-hoc signatures cannot carry an Apple secure timestamp.
+TS_FLAG=(--timestamp)
+[[ "$SIGN_IDENTITY" == "-" ]] && TS_FLAG=(--timestamp=none)
+
 echo "==> 1/4 codesign Mach-O binaries (Hardened Runtime)"
 while IFS= read -r bin; do
   # Only sign actual Mach-O executables.
   if file "$bin" | grep -q 'Mach-O'; then
     echo "    signing $bin"
-    codesign --force --timestamp --options runtime \
+    codesign --force "${TS_FLAG[@]}" --options runtime \
       --entitlements "$ENTITLEMENTS" \
-      --sign "$DEVELOPER_ID_APP" "$bin"
+      --sign "$SIGN_IDENTITY" "$bin"
     codesign --verify --strict --verbose=2 "$bin"
   fi
 done < <(find "$STAGE/bin" -type f)
 
 if [[ "$CODESIGN_ONLY" -eq 1 ]]; then
   echo "OK: binaries codesigned (--codesign-only); skipping pkg/notarize"
+  exit 0
+fi
+
+if [[ "$DEV_MODE" -eq 1 ]]; then
+  # Phase 1: ad-hoc component .pkg for internal distribution. No Developer
+  # ID, so no productsign/notarize/staple. Gatekeeper will quarantine a
+  # downloaded copy; internal testers clear it once per host.
+  DEVPKG="$OUT_DIR/${VERSION_BASENAME}-dev-adhoc.pkg"
+  pkgbuild --root "$STAGE" --identifier "$PKG_IDENTIFIER" \
+    --version "$VERSION" \
+    --install-location "/usr/local/lykuro-native-engine" "$DEVPKG"
+  cat <<EOF
+OK: ad-hoc dev package -> $DEVPKG
+    Internal install: sudo installer -pkg "$DEVPKG" -target /
+    If copied between Macs and Gatekeeper-quarantined, clear it with:
+      xattr -dr com.apple.quarantine /usr/local/lykuro-native-engine
+    This package is NOT for downloads.lykuro.ai (Phase 2 requires
+    Developer ID + notarization).
+EOF
+  shasum -a 256 "$DEVPKG"
   exit 0
 fi
 

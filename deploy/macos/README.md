@@ -11,7 +11,30 @@ thing missing is the certificate + Apple notarization account. This
 directory also holds the environment-independent pieces: the launchd
 definition, the example config, the package layout, and the install docs.
 
-## Producing a signed + notarized package (when the Developer ID is ready)
+## Two-phase distribution
+
+| Phase | Audience | Signing | Command |
+|---|---|---|---|
+| **1 — dev / internal test** | this machine + internal Macs | ad-hoc (Hardened Runtime), **no Apple Developer Program** | `./deploy/macos/sign_and_notarize.sh --dev <stage>` |
+| **2 — downloads.lykuro.ai** | public download | Developer ID + Apple notarization + staple | `./deploy/macos/sign_and_notarize.sh <stage>` (with the identities/creds below) |
+
+Phase 1 needs no certificate: `--dev` signs the binaries ad-hoc with the
+same Hardened Runtime + entitlements posture as release, and builds an
+internal `.pkg`. A downloaded ad-hoc package is Gatekeeper-quarantined, so
+each internal host clears it once:
+
+```
+sudo installer -pkg lykuro-native-engine-macos-metal-<ver>-dev-adhoc.pkg -target /
+xattr -dr com.apple.quarantine /usr/local/lykuro-native-engine   # only if quarantined
+```
+
+To ad-hoc-sign the binaries inside the release tarball as well, run
+`make_package.sh` with `LYKURO_DEV_ADHOC=1`. Phase 1 packages must **never**
+be published to downloads.lykuro.ai — public distribution requires Phase 2
+(Developer ID + notarization), which Gatekeeper accepts without any
+per-host quarantine step.
+
+## Phase 2 — signed + notarized package (when the Developer ID is ready)
 
 One-time: create the Developer ID Application + Installer certs in the
 Apple Developer account, import them into the login keychain, and store a

@@ -37,7 +37,7 @@ Per-item status against LYK-NIE-SD-001 §33 and LYK-NIE-ADD-METAL-001 §34.
 | Platform/Model Manager integration | ✅ | gRPC serving e2e |
 | No Python/Node/Homebrew/Xcode in production | ✅ | host-native binary + frameworks |
 | No third-party inference server | ✅ | same CI gate |
-| Developer ID sign, notarization, Hardened Runtime | ◑ | pipeline implemented + wired (`deploy/macos/sign_and_notarize.sh`, entitlements, make_package hook); codesign form validated ad-hoc; awaits Developer ID cert to run for real |
+| Developer ID sign, notarization, Hardened Runtime | ◑ | two-phase: Phase 1 `--dev` ad-hoc sign (Hardened Runtime, no Developer Program) works today for internal test; Phase 2 (downloads.lykuro.ai) full Developer ID + notarization pipeline implemented + wired, awaits the cert |
 | unit/golden/integration/security/perf/soak results | ✅ | 176/176 tests green; 24h Metal soak PASSED (137440 completed, 0 failed, footprint flat ~2656MB, 100 reload cycles leak 11.7MB) |
 | Mac mini M4 64GB Certified Profile (measured) | ◑ | dev-measured profile issued: `cp_qwen25_05b_m4pro_dev1.yaml` (incl. 24h soak); formal/cross-host cert pending |
 | install/monitor/update/rollback/recovery docs | ◑ | scaffolding in `deploy/macos` |

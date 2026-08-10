@@ -57,7 +57,11 @@ fi
 # posture). The notarized .pkg is produced by the full pipeline (run
 # deploy/macos/sign_and_notarize.sh "$STAGE" after this script).
 if [[ "$PROFILE" == macos-metal ]]; then
-    "$ROOT/deploy/macos/sign_and_notarize.sh" --codesign-only "$STAGE"
+    SIGN_ARGS=(--codesign-only)
+    # Phase 1 internal builds: LYKURO_DEV_ADHOC=1 ad-hoc-signs the binaries
+    # (Hardened Runtime) without an Apple Developer Program membership.
+    [[ "${LYKURO_DEV_ADHOC:-0}" == 1 ]] && SIGN_ARGS+=(--dev)
+    "$ROOT/deploy/macos/sign_and_notarize.sh" "${SIGN_ARGS[@]}" "$STAGE"
 fi
 
 # Per-file checksums (sorted for determinism).
