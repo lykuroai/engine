@@ -57,6 +57,10 @@ fi
 # posture). The notarized .pkg is produced by the full pipeline (run
 # deploy/macos/sign_and_notarize.sh "$STAGE" after this script).
 if [[ "$PROFILE" == macos-metal ]]; then
+    # Self-contained first (spec §23.2: no Homebrew at runtime): bundle all
+    # non-system dylibs into lib/ and rewrite to @rpath. Then codesign the
+    # bundled libs + binaries.
+    "$ROOT/deploy/macos/bundle_dylibs.sh" "$STAGE"
     SIGN_ARGS=(--codesign-only)
     # Phase 1 internal builds: LYKURO_DEV_ADHOC=1 ad-hoc-signs the binaries
     # (Hardened Runtime) without an Apple Developer Program membership.

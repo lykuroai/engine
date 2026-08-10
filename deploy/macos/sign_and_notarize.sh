@@ -71,6 +71,13 @@ NOTICE: no signing identity -> SKIPPED (tree left unsigned).
 EOF
   exit 0
 fi
+# Phase 1 (ad-hoc) needs library validation disabled so the process can
+# load the bundled dylibs (ad-hoc has no Team ID for LV to match). Phase 2
+# signs every bundled dylib with the same Developer ID, so LV passes with
+# the strict empty entitlements.
+if [[ "$DEV_MODE" -eq 1 ]]; then
+  ENTITLEMENTS="$ROOT/deploy/macos/entitlements.dev.plist"
+fi
 command -v codesign >/dev/null || { echo "ERROR: codesign not found" >&2; exit 2; }
 command -v pkgbuild >/dev/null || { echo "ERROR: pkgbuild not found" >&2; exit 2; }
 command -v xcrun >/dev/null || { echo "ERROR: xcrun not found" >&2; exit 2; }
@@ -84,16 +91,21 @@ TS_FLAG=(--timestamp)
 [[ "$SIGN_IDENTITY" == "-" ]] && TS_FLAG=(--timestamp=none)
 
 echo "==> 1/4 codesign Mach-O binaries (Hardened Runtime)"
-while IFS= read -r bin; do
-  # Only sign actual Mach-O executables.
-  if file "$bin" | grep -q 'Mach-O'; then
-    echo "    signing $bin"
-    codesign --force "${TS_FLAG[@]}" --options runtime \
-      --entitlements "$ENTITLEMENTS" \
-      --sign "$SIGN_IDENTITY" "$bin"
-    codesign --verify --strict --verbose=2 "$bin"
-  fi
-done < <(find "$STAGE/bin" -type f)
+sign_one() {
+  local f="$1"
+  file "$f" | grep -q 'Mach-O' || return 0
+  echo "    signing $f"
+  codesign --force "${TS_FLAG[@]}" --options runtime \
+    --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$f"
+  codesign --verify --strict "$f"
+}
+# Bundled dylibs first (inner code), then the executables (outer).
+if [[ -d "$STAGE/lib" ]]; then
+  while IFS= read -r lib; do sign_one "$lib"; done \
+    < <(find "$STAGE/lib" -type f)
+fi
+while IFS= read -r bin; do sign_one "$bin"; done \
+  < <(find "$STAGE/bin" -type f)
 
 if [[ "$CODESIGN_ONLY" -eq 1 ]]; then
   echo "OK: binaries codesigned (--codesign-only); skipping pkg/notarize"
