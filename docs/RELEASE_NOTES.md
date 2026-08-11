@@ -53,6 +53,9 @@ Every operation is a `native-engine <subcommand>`:
 - `serve --config <path>` — the gRPC engine server (legacy `--config` still
   works).
 - `convert <hf_dir> <out_dir>` — HF checkpoint → artifact.
+- `serve --http [--port 11434]` — Ollama- and OpenAI-compatible HTTP API
+  (/api/generate, /api/chat, /api/tags, /api/pull; /v1/chat/completions,
+  /v1/completions, /v1/models). Models given by HF repo id auto-pull.
 
 ### Packaging
 
