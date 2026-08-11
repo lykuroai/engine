@@ -58,6 +58,21 @@ arm64 Linux は `deploy/linux/build_arm64_docker.sh`。手順は
 
 ## 実行
 
+### Ollama 風(config 不要の単体推論)
+
+```sh
+# 一発生成(バックエンドは自動: macOS=Metal / CUDA / CPU)
+native-engine run /models/current "日本の首都は？"
+
+# 対話(プロンプト省略で REPL、Ctrl-D 終了)
+native-engine run /models/current --system "簡潔に答えて"
+# オプション: --backend cpu|metal|metal-fp16|cuda[:N] --max-tokens N --temperature T
+```
+
+設定ファイル・mTLS・サーバ不要。モデルディレクトリを渡すだけで生成します。
+
+### サーバ形態(gRPC + mTLS、production)
+
 ```sh
 # artifact の署名(release pipeline の代替、dev 用)
 ./build/release/tools/sign_artifact keygen signer
