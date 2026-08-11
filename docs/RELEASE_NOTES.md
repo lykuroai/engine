@@ -46,10 +46,10 @@ LYK-NIE-SD-001 and the Metal addendum LYK-NIE-ADD-METAL-001.
 Every operation is a `native-engine <subcommand>`:
 - `pull <hf_repo> [out]` — download a HF checkpoint and convert it to a
   Lykuro artifact **natively (no Python)**.
-- `run <model_dir> ["prompt"] [--backend … --max-tokens N --temperature T
-  --system "…"]` — config-less inference (no mTLS, no server); streams
-  output, or starts an interactive chat with no prompt. Backend
-  auto-selects the best built (Metal > CUDA > CPU).
+- `run <model_or_repo> ["prompt"] [--backend … --max-tokens N --temperature T
+  --system "…"]` — config-less inference. Accepts a local artifact dir OR a
+  HF repo id, which auto-pulls if not already local (single-command run).
+  Streams output, or starts an interactive chat with no prompt.
 - `serve --config <path>` — the gRPC engine server (legacy `--config` still
   works).
 - `convert <hf_dir> <out_dir>` — HF checkpoint → artifact.
