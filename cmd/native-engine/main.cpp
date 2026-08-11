@@ -122,7 +122,7 @@ int PullModel(const std::string& repo, const std::string& out) {
 
 // Resolve a `run` model argument to a local artifact dir. A local directory
 // containing manifest.json is used as-is; otherwise an HF repo id is
-// resolved under ~/.lykuro/models and auto-pulled if absent (ollama-style).
+// resolved under ~/.lykuro/models and auto-pulled if absent (single-command).
 int ResolveModelArg(std::string& dir) {
     namespace fs = std::filesystem;
     if (fs::exists(fs::path(dir) / "manifest.json")) return 0;  // local dir
@@ -139,7 +139,7 @@ int ResolveModelArg(std::string& dir) {
     return 0;  // non-repo, non-local: LoadArtifact reports a clear error
 }
 
-// Config-less, Ollama-style standalone inference. Loads a model directory
+// Config-less, single-command standalone inference. Loads a model directory
 // and generates text directly — no JSON config, no mTLS, no server.
 int RunGenerate(int argc, char** argv) {
     using namespace lykuro::nie;
@@ -179,7 +179,7 @@ int RunGenerate(int argc, char** argv) {
         PrintUsage();
         return 2;
     }
-    // ollama-style: a HF repo id auto-pulls if not already local.
+    // single-command: a HF repo id auto-pulls if not already local.
     if (int rc = ResolveModelArg(dir)) return rc;
 
     ArtifactLoadOptions opt;
@@ -336,7 +336,7 @@ int RunConvert(int argc, char** argv) {
     return 0;
 }
 
-// `pull <hf_repo> [out_dir]` — Ollama-style: curl the HF files (curl sets no
+// `pull <hf_repo> [out_dir]` — single-command: curl the HF files (curl sets no
 // Gatekeeper quarantine) then convert natively.
 int RunPull(int argc, char** argv) {
     if (argc < 3) {
@@ -476,7 +476,7 @@ int RunServe(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Unified subcommands (Ollama-style). These run before legacy flag
+    // Unified subcommands (single-command). These run before legacy flag
     // parsing; `pull`/`run`/`convert` need no JSON config at all.
     if (argc >= 2 && std::strcmp(argv[1], "run") == 0)
         return RunGenerate(argc, argv);
