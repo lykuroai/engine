@@ -79,18 +79,69 @@ native-engine convert <hf_dir> <out_dir>
 ### サーバ形態(gRPC + mTLS、production)
 
 ```sh
-# artifact の署名(fail-closed、production)
+native-engine serve --config engine.json     # 旧 `--config` も後方互換
+```
+`Ctrl-C` で graceful shutdown。gRPC は `grpc_port`、Prometheus metrics は
+`metrics_port`(`/metrics`)で待ち受け。
+
+#### 設定ファイル(engine.json)
+
+入れ子の strict JSON(§26 相当、unknown key は拒否)。
+
+**開発用**(mTLS なし・未署名モデル可):
+```json
+{
+  "engine":        { "id": "nie-local", "listen_address": "127.0.0.1", "grpc_port": 19443, "log_level": "info" },
+  "security":      { "mtls_required": false, "allow_unsigned_dev": true },
+  "model":         { "artifact_path": "~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct" },
+  "hardware":      { "backend": "metal", "device_id": 0 },
+  "scheduler":     { "max_queue": 64, "max_sequences": 4 },
+  "generation":    { "max_output_tokens": 1024 },
+  "observability": { "metrics_enabled": true, "metrics_port": 19090 }
+}
+```
+> `mtls_required:false` は開発専用(起動時に `mtls_disabled` 警告)。
+> `artifact_path` は絶対パス推奨。`backend` は `metal`|`cuda`|`cpu`。
+
+**本番用**(mTLS 必須・署名モデル):
+```json
+{
+  "engine":   { "id": "nie-prod-01", "listen_address": "127.0.0.1", "grpc_port": 19443, "log_level": "info" },
+  "security": {
+    "mtls_required": true,
+    "server_cert_path": "/path/secrets/server.crt",
+    "server_key_path":  "/path/secrets/server.key",
+    "client_ca_path":   "/path/secrets/client-ca.crt",
+    "control_identities": ["lykuro-model-manager"],
+    "data_identities":    ["lykuro-model-manager", "lykuro-gateway"],
+    "trusted_signing_keys": ["<Ed25519公開鍵hex>"]
+  },
+  "model":    { "artifact_path": "/Library/Application Support/Lykuro/Models/current" },
+  "hardware": { "backend": "cuda", "device_id": 0 }
+}
+```
+```sh
+# 本番はモデル artifact を署名(fail-closed)
 ./build/release/tools/sign_artifact keygen signer
 ./build/release/tools/sign_artifact sign signer.key /models/current
-
-# 起動(serve サブコマンド。旧 `--config` も後方互換で動作)
-native-engine serve --config engine.json
 ```
 
-config は strict JSON(§26 相当、unknown key 拒否)。`mtls_required: true`
-では server cert / key / client CA のパスが必須。`trusted_signing_keys`
-(Ed25519 公開鍵 hex)か `allow_unsigned_dev`(開発専用)のどちらかが
-なければ起動を拒否する(fail-closed)。
+| セクション | キー | 説明 |
+|---|---|---|
+| `engine` | `id` / `listen_address` / `grpc_port` / `log_level` | ノード ID・bind 先(loopback 推奨)・ポート・`debug\|info\|warn\|error` |
+| `security` | `mtls_required` | 本番は `true`。`false` は開発専用 |
+| | `server_cert_path` / `server_key_path` / `client_ca_path` | mTLS 有効時に必須 |
+| | `control_identities` / `data_identities` | Control API は Manager 限定、Data API は Manager+Gateway |
+| | `trusted_signing_keys` / `allow_unsigned_dev` | どちらか無いと起動拒否(fail-closed) |
+| `model` | `artifact_path` | 起動時ロードするモデル(未設定なら Control API の LoadModel で後入れ) |
+| `hardware` | `backend` / `device_id` | `metal`\|`cuda`\|`cpu` / GPU 番号 |
+| `scheduler` | `max_queue` / `max_sequences` | 受付キュー長 / 同時デコード数 |
+| `generation` | `max_output_tokens` / `max_input_bytes` | 出力上限 / 入力バイト上限 |
+| `observability` | `metrics_enabled` / `metrics_port` | Prometheus 出力 |
+
+`mtls_required:true` で cert/key/CA いずれか欠落、または署名鍵も
+`allow_unsigned_dev` も無い場合は起動を拒否する(fail-closed)。
+運用(update/rollback/監視)は `docs/operations/runbook.md`。
 
 ## 実装状況(v1.0.0)
 
