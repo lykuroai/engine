@@ -63,6 +63,9 @@ arm64 Linux は `deploy/linux/build_arm64_docker.sh`。手順は
 
 ```sh
 # 1. モデル取得(HF から DL + Lykuro artifact へ変換、Python 不要)
+
+# ローカルモデル一覧(ollama list 相当)
+native-engine list
 native-engine pull Qwen/Qwen2.5-0.5B-Instruct
 #   -> ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct
 

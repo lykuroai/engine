@@ -1,8 +1,11 @@
+#include <sys/stat.h>
+
 #include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -48,6 +51,7 @@ void PrintUsage() {
         "\n"
         "Usage:\n"
         "  native-engine pull <hf_repo> [out_dir]   download + convert a model\n"
+        "  native-engine list                       list local models\n"
         "  native-engine run <model_dir> [\"prompt\"] [options]   "
         "standalone inference (no config)\n"
         "  native-engine serve --http [--port 11434] HTTP API (Ollama + OpenAI)\n"
@@ -325,6 +329,52 @@ int RunGenerate(int argc, char** argv) {
     return 0;
 }
 
+// `list` — show locally available models (like `ollama list`).
+int RunList(int /*argc*/, char** /*argv*/) {
+    namespace fs = std::filesystem;
+    const char* home = std::getenv("HOME");
+    const std::string base =
+        (home ? std::string(home) : ".") + "/.lykuro/models";
+    auto human = [](uintmax_t b) -> std::string {
+        char buf[32];
+        if (b >= (1ull << 30))
+            std::snprintf(buf, sizeof(buf), "%.1f GB", double(b) / (1 << 30));
+        else
+            std::snprintf(buf, sizeof(buf), "%.0f MB", double(b) / (1 << 20));
+        return buf;
+    };
+    std::printf("%-44s %10s  %s\n", "NAME", "SIZE", "MODIFIED");
+    std::error_code ec;
+    int n = 0;
+    if (fs::exists(base, ec)) {
+        std::vector<fs::directory_entry> dirs;
+        for (const auto& e : fs::directory_iterator(base, ec))
+            if (e.is_directory() && fs::exists(e.path() / "manifest.json"))
+                dirs.push_back(e);
+        for (const auto& e : dirs) {
+            uintmax_t sz = fs::file_size(
+                e.path() / "weights" / "model.safetensors", ec);
+            if (ec) sz = 0;
+            struct stat st{};
+            char when[20] = "-";
+            if (::stat((e.path() / "manifest.json").c_str(), &st) == 0) {
+                std::tm tmv{};
+                localtime_r(&st.st_mtime, &tmv);
+                std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tmv);
+            }
+            std::printf("%-44s %10s  %s\n",
+                        e.path().filename().string().c_str(),
+                        human(sz).c_str(), when);
+            ++n;
+        }
+    }
+    if (n == 0)
+        std::fprintf(stderr,
+                     "no models yet. pull one: native-engine pull "
+                     "Qwen/Qwen2.5-0.5B-Instruct\n");
+    return 0;
+}
+
 // `convert <hf_dir> <out_dir>` — native HF->artifact conversion, no Python.
 int RunConvert(int argc, char** argv) {
     if (argc < 4) {
@@ -489,6 +539,8 @@ int main(int argc, char** argv) {
         return RunPull(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "convert") == 0)
         return RunConvert(argc, argv);
+    if (argc >= 2 && std::strcmp(argv[1], "list") == 0)
+        return RunList(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) {
         // --http selects the Ollama/OpenAI-compatible HTTP API.
         for (int i = 2; i < argc; ++i)
