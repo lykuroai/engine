@@ -6,6 +6,32 @@ LYK-NIE-SD-001 v1.0 に基づく独自推論エンジン。第三者推論 Runti
 仕様: `docs/claude_code_lykuro_native_inference_engine_complete_spec_v1_0.md`
 Phase 0 報告: `docs/phase0-report.md`
 
+## ダウンロード / インストール (v1.0.0)
+
+[Releases](https://github.com/lykuroai/engine/releases/tag/v1.0.0) に
+単一自己完結バイナリ(static gRPC/protobuf/abseil)を公開:
+
+| ファイル | プラットフォーム | バックエンド |
+|---|---|---|
+| `lykuro-native-engine-macos-arm64` | macOS Apple Silicon | Metal (Mac GPU) |
+| `lykuro-native-engine-linux-cuda-1.0.0.tar.gz` | Linux x86_64 + NVIDIA | CUDA GPU |
+| `lykuro-native-engine-linux-amd64` | Linux x86_64 (AMD/Intel) | CPU |
+| `lykuro-native-engine-linux-arm64` | Linux aarch64 | CPU |
+
+macOS ワンライナー(Ollama 方式、cert 不要 — curl は Gatekeeper 隔離を
+付けないため ad-hoc 署名バイナリが即実行できる):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lykuroai/engine/main/deploy/macos/install.sh | bash
+```
+
+いずれも gRPC サーバ形態: `native-engine --config engine.json`
+(mTLS + model パス)。詳細は `docs/operations/runbook.md`。
+
+> macOS バイナリは ad-hoc 署名(未公証)。ブラウザ DL 時のみ
+> `xattr -d com.apple.quarantine <file>` が 1 回必要。Developer ID 署名 +
+> Apple 公証版は Phase 2(Apple Developer Program 加入待ち)。
+
 ## Build
 
 ```sh
@@ -20,6 +46,15 @@ cmake --build --preset release
 必要 toolchain: CMake ≥3.24, Ninja, C++20 compiler。
 gRPC 有効時: protobuf + grpc + OpenSSL(dev 環境では Homebrew 可)。
 GoogleTest は dev 専用依存。
+
+### 単一自己完結バイナリ(production)
+
+リリースバイナリは gRPC/protobuf/abseil/OpenSSL を静的リンクした 1 ファイル
+(Homebrew 等の外部 dylib 依存なし)。`third_party/build_grpc_static.sh` で
+static gRPC を用意し、macOS は `release-static` プリセット、Linux は各ホストで
+ビルド。`tools/check_selfcontained.sh` が禁止依存を fail-closed で検査。
+arm64 Linux は `deploy/linux/build_arm64_docker.sh`。手順は
+`docs/operations/releasing.md`。
 
 ## 実行
 
@@ -37,7 +72,14 @@ config は strict JSON(§26 相当、unknown key 拒否)。`mtls_required: true`
 (Ed25519 公開鍵 hex)か `allow_unsigned_dev`(開発専用)のどちらかが
 なければ起動を拒否する(fail-closed)。
 
-## 実装状況(2026-08-07)
+## 実装状況(v1.0.0)
+
+**v1.0.0 リリース済み**(pre-release): 両 24h soak 合格(CUDA 237k req /
+Metal 137k req、失敗 0)、CVE ゲート(SBOM×VEX×OSV)、Unified Memory 段階
+ウォーターマーク、単一自己完結バイナリ、macOS §24 インストーラ、運用/
+リリース runbook。残件は macOS Developer ID 署名・公証(Phase 2、cert 待ち)
+と正式 certified profile 発行。詳細は `docs/DEFINITION_OF_DONE.md`。
+
 
 | Phase | 状態 |
 |---|---|
@@ -48,8 +90,7 @@ config は strict JSON(§26 相当、unknown key 拒否)。`mtls_required: true`
 | 4 Performance | 主要項目完了(bf16常駐/fusion/graphs/paged KV/prefix cache/量子化) |
 | 5 Expansion | **2-GPU tensor parallel(correctness PoC)実装・実機検証済み** |
 
-テスト: macOS 164 件(ASan/UBSan・release 両構成)+
-Linux/GPU **173 件**(CUDA + gRPC + OpenSSL フル構成)、全て成功。
+テスト: **179 件**(macOS release-static / Linux CUDA フル構成)、全て成功。
 検証環境: Ubuntu 22.04、RTX 3060(sm_86)/ GTX 1650(sm_75)、
 CUDA 12.8、driver 570.211、gRPC v1.66(system OpenSSL 3.0)。
 
