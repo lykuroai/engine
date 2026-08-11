@@ -471,12 +471,16 @@ void HandleConnection(int fd) {
 int RunHttpServe(int argc, char** argv) {
     int port = 11434;
     g_backend = "";  // best built
+    std::string host = "127.0.0.1";  // loopback by default (safe)
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--http") continue;
         if (a == "--port" && i + 1 < argc) port = std::atoi(argv[++i]);
         else if (a == "--backend" && i + 1 < argc) g_backend = argv[++i];
+        else if ((a == "--host" || a == "--addr") && i + 1 < argc)
+            host = argv[++i];
     }
+    if (host == "*" || host.empty()) host = "0.0.0.0";
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -487,7 +491,10 @@ int RunHttpServe(int argc, char** argv) {
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // localhost only
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        std::fprintf(stderr, "invalid --host address: %s\n", host.c_str());
+        return 2;
+    }
     addr.sin_port = htons(uint16_t(port));
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
         std::perror("bind");
@@ -497,10 +504,18 @@ int RunHttpServe(int argc, char** argv) {
         std::perror("listen");
         return 1;
     }
+    const bool loopback = (host == "127.0.0.1");
     std::fprintf(stderr,
-                 "lykuro HTTP API on http://127.0.0.1:%d  (Ollama /api/* + "
+                 "lykuro HTTP API on http://%s:%d  (Ollama /api/* + "
                  "OpenAI /v1/*)\n",
-                 port);
+                 host.c_str(), port);
+    if (!loopback)
+        std::fprintf(stderr,
+                     "WARNING: bound to %s — the HTTP API has NO "
+                     "authentication. Expose only on a trusted internal "
+                     "network (firewall it); for authenticated access use "
+                     "the gRPC mTLS server (serve --config).\n",
+                     host.c_str());
     for (;;) {
         int fd = accept(srv, nullptr, nullptr);
         if (fd < 0) continue;

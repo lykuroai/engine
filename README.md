@@ -102,7 +102,15 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 # GET /v1/models, POST /v1/completions も対応
 ```
 OpenAI SDK は `base_url=http://127.0.0.1:11434/v1`、`api_key` は任意文字列で利用可。
-loopback バインド専用・生成は 1 デバイスで直列化。`--port` / `--backend` 指定可。
+生成は 1 デバイスで直列化。`--port` / `--backend` 指定可。
+
+**社内ネットワークから利用**(既定は loopback のみ):
+```sh
+native-engine serve --host 0.0.0.0        # 全 interface で待受 → 他ホストから http://<LAN-IP>:11434
+```
+> ⚠️ HTTP API は**認証なし**。`--host` で外部公開する場合は**信頼できる社内 LAN 限定**にし、
+> ファイアウォールで制限すること。認証が必要なら **gRPC mTLS**(`serve --config`、
+> `data_identities` で client 証明書認可)を使う。
 
 ### サーバ形態(gRPC + mTLS、production)
 
