@@ -41,14 +41,18 @@ LYK-NIE-SD-001 and the Metal addendum LYK-NIE-ADD-METAL-001.
   SBOM against a VEX ledger and OSV, fails closed on unreviewed deps or
   un-waived CRITICAL/HIGH; emits `vulnerability-report.json` in CI.
 
-### Ollama-style standalone CLI
+### Ollama-style unified commands
 
-- `native-engine run <model_dir> ["prompt"] [--backend …] [--max-tokens N]
-  [--temperature T] [--system "…"]` runs inference with **no config file,
-  no mTLS, no server** — just point it at a model directory. Streams
-  detokenized output; with no prompt it starts an interactive chat. The
-  backend auto-selects the best built (Metal > CUDA > CPU). The gRPC server
-  (`--config`) is unchanged.
+Every operation is a `native-engine <subcommand>`:
+- `pull <hf_repo> [out]` — download a HF checkpoint and convert it to a
+  Lykuro artifact **natively (no Python)**.
+- `run <model_dir> ["prompt"] [--backend … --max-tokens N --temperature T
+  --system "…"]` — config-less inference (no mTLS, no server); streams
+  output, or starts an interactive chat with no prompt. Backend
+  auto-selects the best built (Metal > CUDA > CPU).
+- `serve --config <path>` — the gRPC engine server (legacy `--config` still
+  works).
+- `convert <hf_dir> <out_dir>` — HF checkpoint → artifact.
 
 ### Packaging
 
