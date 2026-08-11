@@ -41,6 +41,15 @@ LYK-NIE-SD-001 and the Metal addendum LYK-NIE-ADD-METAL-001.
   SBOM against a VEX ledger and OSV, fails closed on unreviewed deps or
   un-waived CRITICAL/HIGH; emits `vulnerability-report.json` in CI.
 
+### Ollama-style standalone CLI
+
+- `native-engine run <model_dir> ["prompt"] [--backend …] [--max-tokens N]
+  [--temperature T] [--system "…"]` runs inference with **no config file,
+  no mTLS, no server** — just point it at a model directory. Streams
+  detokenized output; with no prompt it starts an interactive chat. The
+  backend auto-selects the best built (Metal > CUDA > CPU). The gRPC server
+  (`--config`) is unchanged.
+
 ### Packaging
 
 - `linux-cuda` and `macos-metal` profiles via `tools/make_package.sh`:
