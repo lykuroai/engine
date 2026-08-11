@@ -76,6 +76,31 @@ native-engine run ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct "日本の首都�
 native-engine convert <hf_dir> <out_dir>
 ```
 
+### HTTP API(Ollama / OpenAI 互換)
+
+```sh
+native-engine serve --http            # 127.0.0.1:11434 で待ち受け
+```
+モデルは HF repo id で指定し、初回に自動 pull + キャッシュ。config 不要。
+
+**Ollama 互換**(`stream:true` で NDJSON):
+```sh
+curl http://127.0.0.1:11434/api/generate \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","prompt":"日本の首都は？","stream":false}'
+curl http://127.0.0.1:11434/api/chat \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"色を3つ"}]}'
+# GET /api/tags, GET /api/version, POST /api/pull も対応
+```
+
+**OpenAI 互換**(`stream:true` で SSE):
+```sh
+curl http://127.0.0.1:11434/v1/chat/completions \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"2+2は?"}]}'
+# GET /v1/models, POST /v1/completions も対応
+```
+OpenAI SDK は `base_url=http://127.0.0.1:11434/v1`、`api_key` は任意文字列で利用可。
+loopback バインド専用・生成は 1 デバイスで直列化。`--port` / `--backend` 指定可。
+
 ### サーバ形態(gRPC + mTLS、production)
 
 ```sh
