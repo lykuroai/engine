@@ -329,7 +329,7 @@ int RunGenerate(int argc, char** argv) {
     return 0;
 }
 
-// `list` — show locally available models (like `ollama list`).
+// `list` — show locally available models (local model list).
 int RunList(int /*argc*/, char** /*argv*/) {
     namespace fs = std::filesystem;
     const char* home = std::getenv("HOME");
