@@ -15,10 +15,12 @@ set -euo pipefail
 VERSION="${LYKURO_VERSION:-v1.0.0}"
 PREFIX="${LYKURO_PREFIX:-/usr/local/bin}"
 ASSET="lykuro-native-engine-macos-arm64"
-DEST="$PREFIX/lykuro-native-engine"
+DEST="$PREFIX/native-engine"
 URL="https://github.com/lykuroai/engine/releases/download/${VERSION}/${ASSET}"
-# Known-good checksum for v1.0.0; override with LYKURO_SHA256 for other tags.
-SHA256="${LYKURO_SHA256:-76a5a9f77a8cd73b51aaba2e77a11630e24c26554a70f106b32b9274334d3fa5}"
+# Integrity: the download is over GitHub HTTPS. For an extra check, set
+# LYKURO_SHA256 to the value shown on the release page. (Not pinned here so
+# the installer never goes stale when a release asset is refreshed.)
+SHA256="${LYKURO_SHA256:-}"
 
 [ "$(uname -s)" = "Darwin" ] || { echo "macOS only" >&2; exit 1; }
 [ "$(uname -m)" = "arm64" ] || { echo "Apple Silicon (arm64) only" >&2; exit 1; }
@@ -47,10 +49,14 @@ fi
 trap - EXIT
 chmod +x "$DEST" 2>/dev/null || sudo chmod +x "$DEST"
 
-echo "==> installed:"
+echo "==> installed: native-engine"
 "$DEST" --version
 cat <<EOF
-Run it (gRPC engine server):
-  lykuro-native-engine --config /path/to/engine.json
-See docs/operations/runbook.md for config, mTLS, and model setup.
+Get started (Ollama-style):
+  native-engine pull Qwen/Qwen2.5-0.5B-Instruct
+  native-engine run ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct "Hello"
+  native-engine serve --config engine.json      # gRPC server
 EOF
+if ! command -v native-engine >/dev/null 2>&1; then
+  echo "NOTE: $PREFIX is not on your PATH — add it or run $DEST directly." >&2
+fi
