@@ -62,6 +62,83 @@ void PrintUsage() {
         kVersion);
 }
 
+// --- model resolution / pull helpers (shared by `pull` and `run`) --------
+
+bool LooksLikeHfRepo(const std::string& s) {
+    if (s.find('/') == std::string::npos) return false;
+    for (char ch : s)
+        if (!std::isalnum((unsigned char)ch) && ch != '/' && ch != '-' &&
+            ch != '_' && ch != '.')
+            return false;
+    return true;
+}
+
+std::string DefaultModelDir(const std::string& repo) {
+    const char* home = std::getenv("HOME");
+    std::string name = repo;
+    for (char& ch : name)
+        if (ch == '/') ch = '_';
+    return (home ? std::string(home) : ".") + "/.lykuro/models/" + name;
+}
+
+// Download an HF checkpoint via curl and convert it natively into `out`.
+int PullModel(const std::string& repo, const std::string& out) {
+    namespace fs = std::filesystem;
+    if (!LooksLikeHfRepo(repo)) {
+        std::fprintf(stderr, "invalid repo id: %s\n", repo.c_str());
+        return 2;
+    }
+    std::error_code ec;
+    const std::string tmp = out + "/.hf-download";
+    fs::create_directories(tmp, ec);
+    auto dl = [&](const char* file, bool required) -> bool {
+        const std::string url =
+            "https://huggingface.co/" + repo + "/resolve/main/" + file;
+        const std::string cmd = "curl -fSL --retry 3 -o '" + tmp + "/" + file +
+                                "' '" + url + "'";
+        std::fprintf(stderr, "pull: %s\n", file);
+        int rc = std::system(cmd.c_str());
+        if (rc != 0 && required)
+            std::fprintf(stderr, "download failed: %s\n", file);
+        return rc == 0;
+    };
+    if (!dl("config.json", true)) return 1;
+    if (!dl("tokenizer.json", true)) return 1;
+    if (!dl("model.safetensors", true)) {
+        std::fprintf(stderr,
+                     "note: only single-file model.safetensors is supported "
+                     "(sharded checkpoints are not yet merged)\n");
+        return 1;
+    }
+    dl("generation_config.json", false);
+    lykuro::nie::Status s = lykuro::nie::ConvertHfQwen(tmp, out);
+    if (!s.ok()) {
+        std::fprintf(stderr, "convert failed: %s\n", s.message().c_str());
+        return 1;
+    }
+    fs::remove_all(tmp, ec);
+    return 0;
+}
+
+// Resolve a `run` model argument to a local artifact dir. A local directory
+// containing manifest.json is used as-is; otherwise an HF repo id is
+// resolved under ~/.lykuro/models and auto-pulled if absent (ollama-style).
+int ResolveModelArg(std::string& dir) {
+    namespace fs = std::filesystem;
+    if (fs::exists(fs::path(dir) / "manifest.json")) return 0;  // local dir
+    if (LooksLikeHfRepo(dir)) {
+        std::string resolved = DefaultModelDir(dir);
+        if (!fs::exists(fs::path(resolved) / "manifest.json")) {
+            std::fprintf(stderr, "model not found locally; pulling %s ...\n",
+                         dir.c_str());
+            int rc = PullModel(dir, resolved);
+            if (rc != 0) return rc;
+        }
+        dir = resolved;
+    }
+    return 0;  // non-repo, non-local: LoadArtifact reports a clear error
+}
+
 // Config-less, Ollama-style standalone inference. Loads a model directory
 // and generates text directly — no JSON config, no mTLS, no server.
 int RunGenerate(int argc, char** argv) {
@@ -102,6 +179,8 @@ int RunGenerate(int argc, char** argv) {
         PrintUsage();
         return 2;
     }
+    // ollama-style: a HF repo id auto-pulls if not already local.
+    if (int rc = ResolveModelArg(dir)) return rc;
 
     ArtifactLoadOptions opt;
     opt.allow_unsigned_dev = true;  // local eval; no signing config here
@@ -260,63 +339,18 @@ int RunConvert(int argc, char** argv) {
 // `pull <hf_repo> [out_dir]` — Ollama-style: curl the HF files (curl sets no
 // Gatekeeper quarantine) then convert natively.
 int RunPull(int argc, char** argv) {
-    namespace fs = std::filesystem;
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: native-engine pull <hf_repo> [out_dir]\n"
                      "  e.g. native-engine pull Qwen/Qwen2.5-0.5B-Instruct\n");
         return 2;
     }
-    std::string repo = argv[2];
-    for (char ch : repo) {
-        if (!std::isalnum((unsigned char)ch) && ch != '/' && ch != '-' &&
-            ch != '_' && ch != '.') {
-            std::fprintf(stderr, "invalid repo id\n");
-            return 2;
-        }
-    }
-    std::string out;
-    if (argc > 3) {
-        out = argv[3];
-    } else {
-        const char* home = std::getenv("HOME");
-        std::string name = repo;
-        for (char& ch : name)
-            if (ch == '/') ch = '_';
-        out = (home ? std::string(home) : ".") + "/.lykuro/models/" + name;
-    }
-    std::error_code ec;
-    const std::string tmp = out + "/.hf-download";
-    fs::create_directories(tmp, ec);
-
-    auto dl = [&](const char* file, bool required) -> bool {
-        const std::string url =
-            "https://huggingface.co/" + repo + "/resolve/main/" + file;
-        const std::string cmd = "curl -fSL --retry 3 -o '" + tmp + "/" + file +
-                                "' '" + url + "'";
-        std::fprintf(stderr, "pull: %s\n", file);
-        int rc = std::system(cmd.c_str());
-        if (rc != 0 && required)
-            std::fprintf(stderr, "download failed: %s\n", file);
-        return rc == 0;
-    };
-    if (!dl("config.json", true)) return 1;
-    if (!dl("tokenizer.json", true)) return 1;
-    if (!dl("model.safetensors", true)) {
-        std::fprintf(stderr,
-                     "note: only single-file model.safetensors is supported "
-                     "(sharded checkpoints are not yet merged)\n");
-        return 1;
-    }
-    dl("generation_config.json", false);
-
-    lykuro::nie::Status s = lykuro::nie::ConvertHfQwen(tmp, out);
-    if (!s.ok()) {
-        std::fprintf(stderr, "convert failed: %s\n", s.message().c_str());
-        return 1;
-    }
-    fs::remove_all(tmp, ec);
-    std::fprintf(stderr, "pulled -> %s\n  run it: native-engine run %s \"...\"\n",
+    const std::string repo = argv[2];
+    const std::string out = argc > 3 ? argv[3] : DefaultModelDir(repo);
+    int rc = PullModel(repo, out);
+    if (rc != 0) return rc;
+    std::fprintf(stderr,
+                 "pulled -> %s\n  run it: native-engine run %s \"...\"\n",
                  out.c_str(), out.c_str());
     return 0;
 }
