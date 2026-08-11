@@ -34,6 +34,10 @@
 #include "api/server/grpc_server.h"
 #endif
 
+namespace lykuro::nie {
+int RunHttpServe(int argc, char** argv);  // http_api.cpp
+}
+
 namespace {
 
 constexpr const char kVersion[] = "1.0.0";
@@ -46,6 +50,7 @@ void PrintUsage() {
         "  native-engine pull <hf_repo> [out_dir]   download + convert a model\n"
         "  native-engine run <model_dir> [\"prompt\"] [options]   "
         "standalone inference (no config)\n"
+        "  native-engine serve --http [--port 11434] HTTP API (Ollama + OpenAI)\n"
         "  native-engine serve --config <path>      gRPC engine server\n"
         "  native-engine convert <hf_dir> <out_dir> HF checkpoint -> artifact\n"
         "  native-engine --version | --help\n"
@@ -485,6 +490,10 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "convert") == 0)
         return RunConvert(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) {
+        // --http selects the Ollama/OpenAI-compatible HTTP API.
+        for (int i = 2; i < argc; ++i)
+            if (std::strcmp(argv[i], "--http") == 0)
+                return lykuro::nie::RunHttpServe(argc, argv);
 #ifdef LYKURO_HAVE_GRPC
         return RunServe(argc, argv);
 #else
