@@ -1,7 +1,9 @@
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -10,6 +12,7 @@
 #include "core/engine/config.h"
 #include "core/generation/sampler.h"
 #include "model/architectures/generative_model.h"
+#include "model/convert/hf_convert.h"
 #include "model/loader/artifact_loader.h"
 #include "model/tokenizer/bpe_tokenizer.h"
 #include "model/tokenizer/prompt_template.h"
@@ -40,10 +43,11 @@ void PrintUsage() {
         "lykuro-native-engine %s\n"
         "\n"
         "Usage:\n"
+        "  native-engine pull <hf_repo> [out_dir]   download + convert a model\n"
         "  native-engine run <model_dir> [\"prompt\"] [options]   "
         "standalone inference (no config)\n"
-        "  native-engine --config <path>                          "
-        "gRPC engine server\n"
+        "  native-engine serve --config <path>      gRPC engine server\n"
+        "  native-engine convert <hf_dir> <out_dir> HF checkpoint -> artifact\n"
         "  native-engine --version | --help\n"
         "\n"
         "run options:\n"
@@ -237,6 +241,86 @@ int RunGenerate(int argc, char** argv) {
     return 0;
 }
 
+// `convert <hf_dir> <out_dir>` — native HF->artifact conversion, no Python.
+int RunConvert(int argc, char** argv) {
+    if (argc < 4) {
+        std::fprintf(stderr,
+                     "usage: native-engine convert <hf_dir> <out_dir>\n");
+        return 2;
+    }
+    lykuro::nie::Status s = lykuro::nie::ConvertHfQwen(argv[2], argv[3]);
+    if (!s.ok()) {
+        std::fprintf(stderr, "convert failed: %s\n", s.message().c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "artifact written to %s\n", argv[3]);
+    return 0;
+}
+
+// `pull <hf_repo> [out_dir]` — Ollama-style: curl the HF files (curl sets no
+// Gatekeeper quarantine) then convert natively.
+int RunPull(int argc, char** argv) {
+    namespace fs = std::filesystem;
+    if (argc < 3) {
+        std::fprintf(stderr,
+                     "usage: native-engine pull <hf_repo> [out_dir]\n"
+                     "  e.g. native-engine pull Qwen/Qwen2.5-0.5B-Instruct\n");
+        return 2;
+    }
+    std::string repo = argv[2];
+    for (char ch : repo) {
+        if (!std::isalnum((unsigned char)ch) && ch != '/' && ch != '-' &&
+            ch != '_' && ch != '.') {
+            std::fprintf(stderr, "invalid repo id\n");
+            return 2;
+        }
+    }
+    std::string out;
+    if (argc > 3) {
+        out = argv[3];
+    } else {
+        const char* home = std::getenv("HOME");
+        std::string name = repo;
+        for (char& ch : name)
+            if (ch == '/') ch = '_';
+        out = (home ? std::string(home) : ".") + "/.lykuro/models/" + name;
+    }
+    std::error_code ec;
+    const std::string tmp = out + "/.hf-download";
+    fs::create_directories(tmp, ec);
+
+    auto dl = [&](const char* file, bool required) -> bool {
+        const std::string url =
+            "https://huggingface.co/" + repo + "/resolve/main/" + file;
+        const std::string cmd = "curl -fSL --retry 3 -o '" + tmp + "/" + file +
+                                "' '" + url + "'";
+        std::fprintf(stderr, "pull: %s\n", file);
+        int rc = std::system(cmd.c_str());
+        if (rc != 0 && required)
+            std::fprintf(stderr, "download failed: %s\n", file);
+        return rc == 0;
+    };
+    if (!dl("config.json", true)) return 1;
+    if (!dl("tokenizer.json", true)) return 1;
+    if (!dl("model.safetensors", true)) {
+        std::fprintf(stderr,
+                     "note: only single-file model.safetensors is supported "
+                     "(sharded checkpoints are not yet merged)\n");
+        return 1;
+    }
+    dl("generation_config.json", false);
+
+    lykuro::nie::Status s = lykuro::nie::ConvertHfQwen(tmp, out);
+    if (!s.ok()) {
+        std::fprintf(stderr, "convert failed: %s\n", s.message().c_str());
+        return 1;
+    }
+    fs::remove_all(tmp, ec);
+    std::fprintf(stderr, "pulled -> %s\n  run it: native-engine run %s \"...\"\n",
+                 out.c_str(), out.c_str());
+    return 0;
+}
+
 #ifdef LYKURO_HAVE_GRPC
 
 std::atomic<bool> g_stop{false};
@@ -327,15 +411,54 @@ int RunServer(const lykuro::nie::FileConfig& config) {
     return 0;
 }
 
+// `serve --config <path>` (or `serve <path>`) — the gRPC engine server.
+int RunServe(int argc, char** argv) {
+    using namespace lykuro::nie;
+    const char* cfg = nullptr;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--config" && i + 1 < argc) cfg = argv[++i];
+        else if (!a.empty() && a[0] != '-' && cfg == nullptr) cfg = argv[i];
+        else {
+            std::fprintf(stderr, "unknown serve argument: %s\n", a.c_str());
+            return 2;
+        }
+    }
+    if (cfg == nullptr) {
+        std::fprintf(stderr, "usage: native-engine serve --config <path>\n");
+        return 2;
+    }
+    FileConfigResult config = LoadFileConfig(cfg);
+    if (!config.status.ok()) {
+        std::fprintf(stderr, "config error: %s\n",
+                     config.status.message().c_str());
+        return 1;
+    }
+    return RunServer(config.config);
+}
+
 #endif  // LYKURO_HAVE_GRPC
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Ollama-style standalone inference: `native-engine run <model> ...`.
-    // Handled before config parsing — it needs no JSON config at all.
-    if (argc >= 2 && std::strcmp(argv[1], "run") == 0) {
+    // Unified subcommands (Ollama-style). These run before legacy flag
+    // parsing; `pull`/`run`/`convert` need no JSON config at all.
+    if (argc >= 2 && std::strcmp(argv[1], "run") == 0)
         return RunGenerate(argc, argv);
+    if (argc >= 2 && std::strcmp(argv[1], "pull") == 0)
+        return RunPull(argc, argv);
+    if (argc >= 2 && std::strcmp(argv[1], "convert") == 0)
+        return RunConvert(argc, argv);
+    if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) {
+#ifdef LYKURO_HAVE_GRPC
+        return RunServe(argc, argv);
+#else
+        std::fprintf(stderr,
+                     "this build has no gRPC transport; rebuild with "
+                     "-DLYKURO_ENABLE_GRPC=ON\n");
+        return 1;
+#endif
     }
 
     const char* config_path = nullptr;

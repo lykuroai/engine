@@ -5,6 +5,7 @@ add_library(lykuro_model STATIC
     tokenizer/bpe_tokenizer.cpp
     tokenizer/prompt_template.cpp
     architectures/qwen/qwen_model.cpp
+    convert/hf_convert.cpp
 )
 target_include_directories(lykuro_model PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(lykuro_model

@@ -25,8 +25,9 @@ macOS ワンライナー(Ollama 方式、cert 不要 — curl は Gatekeeper 隔
 curl -fsSL https://raw.githubusercontent.com/lykuroai/engine/main/deploy/macos/install.sh | bash
 ```
 
-いずれも gRPC サーバ形態: `native-engine --config engine.json`
-(mTLS + model パス)。詳細は `docs/operations/runbook.md`。
+使い方: `native-engine pull <hf_repo>` → `native-engine run <model> "..."`
+(config 不要)。サーバは `native-engine serve --config engine.json`。
+詳細は下記「実行」と `docs/operations/runbook.md`。
 
 > macOS バイナリは ad-hoc 署名(未公証)。ブラウザ DL 時のみ
 > `xattr -d com.apple.quarantine <file>` が 1 回必要。Developer ID 署名 +
@@ -56,30 +57,34 @@ static gRPC を用意し、macOS は `release-static` プリセット、Linux �
 arm64 Linux は `deploy/linux/build_arm64_docker.sh`。手順は
 `docs/operations/releasing.md`。
 
-## 実行
+## 実行(Ollama 風・統一コマンド)
 
-### Ollama 風(config 不要の単体推論)
+すべて `native-engine <サブコマンド>`:
 
 ```sh
-# 一発生成(バックエンドは自動: macOS=Metal / CUDA / CPU)
-native-engine run /models/current "日本の首都は？"
+# 1. モデル取得(HF から DL + Lykuro artifact へ変換、Python 不要)
+native-engine pull Qwen/Qwen2.5-0.5B-Instruct
+#   -> ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct
 
-# 対話(プロンプト省略で REPL、Ctrl-D 終了)
-native-engine run /models/current --system "簡潔に答えて"
-# オプション: --backend cpu|metal|metal-fp16|cuda[:N] --max-tokens N --temperature T
+# 2. 生成(config 不要。backend 自動: macOS=Metal / CUDA / CPU)
+native-engine run ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct "日本の首都は？"
+#   対話は プロンプト省略で REPL(Ctrl-D 終了)
+#   オプション: --backend cpu|metal|metal-fp16|cuda[:N] --max-tokens N
+#              --temperature T --system "..."
+
+# 既存の HF チェックポイントを変換だけする場合
+native-engine convert <hf_dir> <out_dir>
 ```
-
-設定ファイル・mTLS・サーバ不要。モデルディレクトリを渡すだけで生成します。
 
 ### サーバ形態(gRPC + mTLS、production)
 
 ```sh
-# artifact の署名(release pipeline の代替、dev 用)
+# artifact の署名(fail-closed、production)
 ./build/release/tools/sign_artifact keygen signer
 ./build/release/tools/sign_artifact sign signer.key /models/current
 
-# engine 起動
-./build/release/cmd/native-engine/native-engine --config engine.json
+# 起動(serve サブコマンド。旧 `--config` も後方互換で動作)
+native-engine serve --config engine.json
 ```
 
 config は strict JSON(§26 相当、unknown key 拒否)。`mtls_required: true`
