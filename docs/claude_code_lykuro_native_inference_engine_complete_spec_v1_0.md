@@ -3,8 +3,8 @@
 | 項目 | 内容 |
 |---|---|
 | 文書番号 | LYK-NIE-SD-001 |
-| 版 | v1.0 Claude Code Edition |
-| 制定日 | 2026-08-07 |
+| 版 | v1.1 Claude Code Edition |
+| 制定日 | 2026-08-07(改訂 2026-08-12) |
 | 作成 | 株式会社eビジネスソリューション / Lykuro.ai |
 | Project | lykuro-native-inference-engine |
 | 対象 | Native Inference Engine本体、Model Architecture Plugin、GPU Backend |
@@ -500,6 +500,33 @@ response.error
 ~~~
 
 eventはrequest_id、monotonic sequence、timestampを持つ。
+
+### 9.8 HTTP互換API(Ollama / OpenAI互換)
+
+`native-engine serve`(または `serve --http`)で有効化する開発者向けHTTP APIを提供する。gRPC Internal APIの代替ではなく、ローカル利用・エコシステム互換のための補助surfaceである。
+
+- 既定bindは `127.0.0.1:11434`。`--port` で変更、`--host` で他interfaceへのbindを明示的に許可する(既定はloopbackのみ、§9.1の原則に従う)。
+- modelはHF repo idで指定し、未取得なら自動pull + cacheする。
+- 生成は1 deviceで直列化する。
+
+| Method | Path | 互換 | 用途 |
+|---|---|---|---|
+| GET | /api/version | Ollama | version情報 |
+| GET | /api/tags | Ollama | local model一覧 |
+| POST | /api/pull | Ollama | model取得 |
+| POST | /api/generate | Ollama | 生成(`stream:true` でNDJSON) |
+| POST | /api/chat | Ollama | chat生成(同上) |
+| GET | /v1/models | OpenAI | model一覧 |
+| POST | /v1/chat/completions | OpenAI | chat生成(`stream:true` でSSE) |
+| POST | /v1/completions | OpenAI | 生成(同上) |
+
+`GET /api/version` はengine実装の識別のため `engine` fieldを必須で返す(v1.0.1以降):
+
+~~~json
+{"version":"1.0.1","engine":"lykuro-native-engine"}
+~~~
+
+clientはOllama本家と本engineを `engine` fieldの有無で判別できる。`version` はengine本体のrelease versionと一致する。
 
 ---
 
@@ -1924,3 +1951,4 @@ GPU、driver、model artifact、署名鍵、Kubernetes等がなく検証でき�
 | 版 | 日付 | 内容 |
 |---|---|---|
 | v1.0 | 2026-08-07 | Native Engineの独立project、API、model plugin、推論、scheduler、memory、GPU、security、testを完全定義 |
+| v1.1 | 2026-08-12 | §9.8 HTTP互換API(Ollama / OpenAI)を追加。`GET /api/version` の `engine` field(engine実装識別、release v1.0.1)を規定 |
