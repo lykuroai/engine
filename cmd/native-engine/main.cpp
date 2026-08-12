@@ -43,7 +43,7 @@ int RunHttpServe(int argc, char** argv);  // http_api.cpp
 
 namespace {
 
-constexpr const char kVersion[] = "1.0.0";
+constexpr const char kVersion[] = "1.0.1";
 
 void PrintUsage() {
     std::printf(

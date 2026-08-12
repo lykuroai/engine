@@ -1,5 +1,10 @@
 # Release Notes
 
+## v1.0.1 (2026-08-12)
+
+- `GET /api/version` now identifies the engine: the response gains an
+  `"engine":"lykuro-native-engine"` field alongside `"version"`.
+
 ## v1.0.0 (2026-08-11)
 
 First release of the Lykuro Native Inference Engine — a from-scratch
