@@ -292,15 +292,26 @@ activations は FP16・accumulate は全て FP32・logits は FP32 出力。
 全 reduction は固定順序で run-to-run bit-exact。GEMV は 1 simdgroup
 2 行担当(x ロード共有 + メモリ並列度倍増)で短い行でも帯域を出す。
 
-実測(M4 Pro 64GB、256 token 生成、median of 3、クライアント計測、
-参考値は同一手法で計測した Ollama 0.32.5 q4_K_M):
+**Phase 4 第三弾 — greedy GPU パイプライン + split-row attention**:
+greedy 生成は on-GPU argmax + embedding gather で最大 16 token を
+1 command buffer に投機 encode し、さらに次バッチを常時 1 本先行
+commit(CPU-GPU 往復と GPU アイドルを排除。温度>0 は従来どおり
+per-token Decode + CPU sampler)。attention は head×セグメント分割の
+split-row flash-decoding(固定順 merge で決定性維持、セグメント長は
+~1024/hd 行)。この 2 つで decode がさらに 1.7 倍。
 
-| Model | backend | decode tok/s | TTFT | 参考: Ollama q4_K_M |
-|---|---|---:|---:|---:|
-| Qwen2.5-0.5B | metal-q4(既定) | **278** | **42 ms** | 246 / 103 ms |
-| Qwen2.5-0.5B | metal-q8 | 228 | 54 ms | — |
-| Qwen2.5-0.5B | metal-fast (FP16) | 158 | 84 ms | (FP16: 167) |
-| Qwen2.5-1.5B | metal-q4(既定) | **163** | **90 ms** | 154 / 101 ms |
+実測(M4 Pro 64GB、256 token 生成、median of 3、クライアント計測。
+参考値は同一手法の Ollama 0.32.5 q4_K_M と、mlx-lm 自己申告値):
+
+| Model | backend | decode tok/s | TTFT | Ollama q4_K_M | MLX 4bit |
+|---|---|---:|---:|---:|---:|
+| Qwen2.5-0.5B | metal-q4(既定) | **485** | **37 ms** | 246 / 103 ms | 441 |
+| Qwen2.5-1.5B | metal-q4(既定) | **210** | **89 ms** | 154 / 101 ms | 214 |
+
+0.5B は MLX (Apple 純正、in-process 計測) を約 10% 上回り、1.5B は
+HTTP 経由の計測込みで同等(-2%)。greedy 軌道は `GreedyRun` の on-GPU
+argmax(同値は最小 index)が Sampler の greedy 規則と一致し、逐次
+Decode+argmax と bit 一致することを parity test で強制。
 
 品質ゲート: FP16 kernel パスは CPU reference と teacher-forced 軌道で
 logits 一致(tiny model tol 0.05、実 checkpoint で greedy 出力一致を

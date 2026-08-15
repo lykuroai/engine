@@ -1,5 +1,26 @@
 # Release Notes
 
+## Unreleased
+
+### Greedy GPU pipeline + split-row attention — ahead of MLX on 0.5B
+
+- Greedy decoding now runs up to 16 speculative steps per command
+  buffer with on-GPU argmax (Sampler's exact rule: max, ties to the
+  lowest index) and on-GPU embedding gather, and always keeps one
+  speculative batch committed ahead of the one being consumed — the
+  CPU/GPU round trip disappears from the decode loop. Temperature > 0
+  keeps the per-token Decode + CPU sampler path. New GenerativeModel
+  API: SupportsGreedyRun/GreedyRun (backend-optional).
+- Attention switches to split-row flash decoding (heads x segments,
+  fixed-order merge, deterministic); prompt prefill batches whole
+  chunks into one command buffer.
+- Qwen2.5-0.5B on an M4 Pro: 485 tok/s / TTFT 37 ms (was 278/42; MLX
+  4bit self-reported: 441; Ollama q4_K_M: 246/103 ms). Qwen2.5-1.5B:
+  210 tok/s (MLX: 214, Ollama: 154).
+- Parity tests force GreedyRun to match sequential Decode + greedy
+  argmax bit-exactly, cover the long-context attention kernels, and
+  exercise speculative-trajectory divergence/flush.
+
 ## v1.0.3 (2026-08-15)
 
 ### Metal kernel backend — faster than Ollama on Apple Silicon

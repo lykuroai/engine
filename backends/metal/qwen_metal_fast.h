@@ -56,12 +56,26 @@ public:
     Status Decode(SequenceState& state, uint32_t token,
                   std::vector<float>& logits) override;
 
+    // Greedy fast path: N speculative decode steps in one command buffer
+    // with on-GPU argmax sampling and embedding gather between steps.
+    bool SupportsGreedyRun() const override { return true; }
+    Status GreedyRun(SequenceState& state, uint32_t token, uint32_t max_new,
+                     std::vector<uint32_t>& out_tokens) override;
+
 private:
     QwenMetalFastModel() = default;
 
     struct Impl;
     Status ForwardToken(uint32_t token, uint32_t pos, void* sequence_state,
                         std::vector<float>& logits_out, bool want_logits);
+    // Encodes one forward pass (input = the resident x buffer) onto an
+    // open compute encoder; logits land in the resident logits buffer
+    // when requested. `enc` is an id<MTLComputeCommandEncoder>.
+    void EncodeStep(void* enc, void* sequence_state, uint32_t pos,
+                    bool want_logits, uint32_t parity = 0);
+    void EncodeArgmax(void* enc, uint32_t slot, bool gather_next,
+                      uint32_t parity);
+    void EncodeGather(void* enc, uint32_t slot);
 
     QwenConfig config_;
     ModelLimits limits_;

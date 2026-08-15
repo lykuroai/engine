@@ -232,24 +232,45 @@ int RunGenerate(int argc, char** argv) {
         if (!sampler.Sample(logits, token).ok()) return 1;
         std::vector<uint32_t> gen;
         std::string printed;
+        std::string bytes;              // incremental detokenization
+        std::vector<uint32_t> one(1);
+        std::vector<uint32_t> pending;  // greedy-run token queue
+        size_t pending_i = 0;
+        const bool greedy_fast =
+            !(temperature > 0.0f) && model->SupportsGreedyRun();
         for (int n = 0; n < max_tokens; ++n) {
             if (is_eos(token)) break;
             gen.push_back(token);
-            std::string bytes;
-            tok.DecodeBytes(gen, bytes);
+            one[0] = token;
+            tok.DecodeBytes(one, bytes);
             if (bytes.size() > printed.size()) {
                 std::fwrite(bytes.data() + printed.size(), 1,
                             bytes.size() - printed.size(), stdout);
                 std::fflush(stdout);
                 printed = bytes;
             }
-            s = model->Decode(*st, token, logits);
-            if (!s.ok()) {
-                std::fprintf(stderr, "\ndecode failed: %s\n",
-                             s.message().c_str());
-                return 1;
+            if (greedy_fast) {
+                if (pending_i >= pending.size()) {
+                    pending.clear();
+                    pending_i = 0;
+                    s = model->GreedyRun(*st, token,
+                                         uint32_t(max_tokens - n), pending);
+                    if (!s.ok() || pending.empty()) {
+                        std::fprintf(stderr, "\ndecode failed: %s\n",
+                                     s.message().c_str());
+                        return 1;
+                    }
+                }
+                token = pending[pending_i++];
+            } else {
+                s = model->Decode(*st, token, logits);
+                if (!s.ok()) {
+                    std::fprintf(stderr, "\ndecode failed: %s\n",
+                                 s.message().c_str());
+                    return 1;
+                }
+                if (!sampler.Sample(logits, token).ok()) return 1;
             }
-            if (!sampler.Sample(logits, token).ok()) return 1;
         }
         std::printf("\n");
         std::string reply;

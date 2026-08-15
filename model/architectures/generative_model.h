@@ -85,6 +85,23 @@ public:
         }
         return Status::Ok();
     }
+
+    // Optional greedy fast path: runs up to `max_new` decode steps
+    // entirely inside the backend, sampling with the greedy rule
+    // (argmax, ties resolved to the lowest index — identical to
+    // Sampler's). Returns the sampled tokens in order; the sequence
+    // advances by max_new (the caller truncates at EOS and drops the
+    // sequence, so overshoot positions are dead cache rows). Non-finite
+    // detection is guaranteed at run granularity, not per token: a NaN
+    // propagates through the KV chain into the final logits, which are
+    // scanned. Backends advertise the capability via SupportsGreedyRun.
+    virtual bool SupportsGreedyRun() const { return false; }
+    virtual Status GreedyRun(SequenceState& /*state*/, uint32_t /*token*/,
+                             uint32_t /*max_new*/,
+                             std::vector<uint32_t>& /*out_tokens*/) {
+        return Status(ErrorCode::kInternalError, "greedy run unsupported",
+                      "model");
+    }
 };
 
 }  // namespace lykuro::nie

@@ -212,22 +212,49 @@ Status Generate(Session& s, const std::vector<ChatMessage>& messages,
         return Status(ErrorCode::kInferenceFailed, "sample failed", "generator");
     std::vector<uint32_t> gen;
     std::string printed;
+    std::string bytes;              // accumulated raw output bytes
+    std::vector<uint32_t> one_token(1);
+    std::vector<uint32_t> pending;  // greedy-run token queue
+    size_t pending_i = 0;
     completion_tokens = 0;
     for (int n = 0; n < params.max_tokens; ++n) {
         if (is_eos(token)) break;
         gen.push_back(token);
         ++completion_tokens;
-        std::string bytes;
-        tok.DecodeBytes(gen, bytes);
+        // Incremental detokenization: DecodeBytes is per-token
+        // concatenative, so append just the new token's bytes instead of
+        // re-decoding the whole sequence every step (O(n^2) at 400 tok/s
+        // is real money).
+        one_token[0] = token;
+        tok.DecodeBytes(one_token, bytes);
         if (bytes.size() > printed.size()) {
             std::string delta = bytes.substr(printed.size());
             printed = bytes;
             if (on_delta && !on_delta(delta)) break;  // consumer gone
         }
-        st = s.model->Decode(*seq, token, logits);
-        if (!st.ok()) return st;
-        if (!sampler.Sample(logits, token).ok())
-            return Status(ErrorCode::kInferenceFailed, "sample failed", "generator");
+        // Greedy fast path: the backend runs several decode steps per
+        // call with on-GPU argmax (same rule as Sampler's greedy), so
+        // tokens arrive in small batches instead of one CPU/GPU round
+        // trip each. Falls back to Decode+Sample for temperature > 0.
+        if (!(params.temperature > 0.0f) && s.model->SupportsGreedyRun()) {
+            if (pending_i >= pending.size()) {
+                pending.clear();
+                pending_i = 0;
+                st = s.model->GreedyRun(
+                    *seq, token, uint32_t(params.max_tokens - n), pending);
+                if (!st.ok()) return st;
+                if (pending.empty())
+                    return Status(ErrorCode::kInferenceFailed,
+                                  "empty greedy run", "generator");
+            }
+            token = pending[pending_i++];
+        } else {
+            st = s.model->Decode(*seq, token, logits);
+            if (!st.ok()) return st;
+            if (!sampler.Sample(logits, token).ok())
+                return Status(ErrorCode::kInferenceFailed, "sample failed",
+                              "generator");
+        }
     }
     full_out = printed;
     return Status::Ok();
