@@ -148,7 +148,7 @@ Status LoadSession(const std::string& dir_in, const std::string& backend_in,
 
 Status Generate(Session& s, const std::vector<ChatMessage>& messages,
                 const GenParams& params,
-                const std::function<void(const std::string&)>& on_delta,
+                const std::function<bool(const std::string&)>& on_delta,
                 std::string& full_out, uint32_t& prompt_tokens,
                 uint32_t& completion_tokens) {
     const BpeTokenizer& tok = *s.loaded.artifact.tokenizer;
@@ -195,8 +195,8 @@ Status Generate(Session& s, const std::vector<ChatMessage>& messages,
         tok.DecodeBytes(gen, bytes);
         if (bytes.size() > printed.size()) {
             std::string delta = bytes.substr(printed.size());
-            if (on_delta) on_delta(delta);
             printed = bytes;
+            if (on_delta && !on_delta(delta)) break;  // consumer gone
         }
         st = s.model->Decode(*seq, token, logits);
         if (!st.ok()) return st;

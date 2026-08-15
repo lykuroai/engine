@@ -135,13 +135,14 @@ bool ReadRequest(int fd, Request& req) {
     return true;
 }
 
-void WriteAll(int fd, const std::string& s) {
+bool WriteAll(int fd, const std::string& s) {
     size_t off = 0;
     while (off < s.size()) {
         ssize_t n = write(fd, s.data() + off, s.size() - off);
-        if (n <= 0) return;
+        if (n <= 0) return false;  // EPIPE etc.: client is gone
         off += size_t(n);
     }
+    return true;
 }
 
 void SendJson(int fd, int code, const std::string& json) {
@@ -164,13 +165,11 @@ void BeginChunked(int fd, const char* content_type) {
                     "Connection: close\r\n\r\n";
     WriteAll(fd, h);
 }
-void SendChunk(int fd, const std::string& data) {
-    if (data.empty()) return;
+bool SendChunk(int fd, const std::string& data) {
+    if (data.empty()) return true;
     char len[32];
     std::snprintf(len, sizeof(len), "%zx\r\n", data.size());
-    WriteAll(fd, len);
-    WriteAll(fd, data);
-    WriteAll(fd, "\r\n");
+    return WriteAll(fd, len) && WriteAll(fd, data) && WriteAll(fd, "\r\n");
 }
 void EndChunked(int fd) { WriteAll(fd, "0\r\n\r\n"); }
 
@@ -279,7 +278,7 @@ void HandleModels(int fd) {  // OpenAI GET /v1/models
 // on_delta when streaming; returns full text + counts.
 Status RunGen(const std::string& model,
               const std::vector<ChatMessage>& msgs, const cli::GenParams& p,
-              const std::function<void(const std::string&)>& on_delta,
+              const std::function<bool(const std::string&)>& on_delta,
               std::string& full, uint32_t& pt, uint32_t& ct,
               std::string& err) {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -324,8 +323,8 @@ void HandleOllamaGenerate(int fd, const json::Value* root, bool chat) {
         BeginChunked(fd, "application/x-ndjson");
         Status s = RunGen(
             model, msgs, p,
-            [&](const std::string& d) { SendChunk(fd, line(d, false)); }, full,
-            pt, ct, err);
+            [&](const std::string& d) { return SendChunk(fd, line(d, false)); },
+            full, pt, ct, err);
         if (!s.ok()) {
             SendChunk(fd, "{\"error\":\"" + JsonEsc(err.empty()
                                                         ? s.message()
@@ -401,7 +400,7 @@ void HandleOpenAiChat(int fd, const json::Value* root, bool chat) {
                             JsonEsc(model) + "\",\"choices\":[{\"index\":0,"
                             "\"delta\":{\"content\":\"" + JsonEsc(delta) +
                             "\"},\"finish_reason\":null}]}";
-            SendChunk(fd, "data: " + d + "\n\n");
+            return SendChunk(fd, "data: " + d + "\n\n");
         };
         Status s = RunGen(model, msgs, p, chunk, full, pt, ct, err);
         std::string fin = "{\"id\":\"" + id +

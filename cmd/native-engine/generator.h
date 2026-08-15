@@ -47,11 +47,13 @@ Status LoadSession(const std::string& dir, const std::string& backend,
                    Session& out);
 
 // Generate from chat messages. `on_delta` is called with each newly
-// decoded text fragment (for streaming); `full_out` receives the complete
-// reply. `prompt_tokens`/`completion_tokens` receive token counts.
+// decoded text fragment (for streaming) and returns whether to continue;
+// returning false (e.g. the client disconnected) stops decoding early and
+// Generate returns Ok with the partial text. `full_out` receives the
+// decoded reply. `prompt_tokens`/`completion_tokens` receive token counts.
 Status Generate(Session& s, const std::vector<ChatMessage>& messages,
                 const GenParams& params,
-                const std::function<void(const std::string&)>& on_delta,
+                const std::function<bool(const std::string&)>& on_delta,
                 std::string& full_out, uint32_t& prompt_tokens,
                 uint32_t& completion_tokens);
 
