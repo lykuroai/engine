@@ -155,8 +155,20 @@ Status LoadSession(const std::string& dir_in, const std::string& backend_in,
     } else if (b.rfind("cuda", 0) == 0) {
 #ifdef LYKURO_HAVE_CUDA
         CudaModelOptions co;
-        auto p = b.find(':');
-        if (p != std::string::npos) co.device_id = std::atoi(b.c_str() + p + 1);
+        // cuda[:N] | cuda-q8[:N] | cuda-q4[:N] (weight-only quantization,
+        // same scheme the Metal backend exposes as metal-q8/q4).
+        std::string cb = b;
+        auto p = cb.find(':');
+        if (p != std::string::npos) {
+            co.device_id = std::atoi(cb.c_str() + p + 1);
+            cb = cb.substr(0, p);
+        }
+        if (cb == "cuda-q8") co.quantization = WeightQuant::kInt8;
+        else if (cb == "cuda-q4") co.quantization = WeightQuant::kInt4;
+        else if (cb != "cuda") {
+            return Status(ErrorCode::kInvalidRequest, "unknown backend: " + b,
+                          "generator");
+        }
         auto c = QwenCudaModel::Load(out.loaded.artifact.manifest,
                                      *out.loaded.artifact.weights, co);
         if (!c.status.ok()) return c.status;

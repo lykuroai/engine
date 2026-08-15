@@ -64,7 +64,7 @@ void PrintUsage() {
         "\n"
         "run options:\n"
         "  --backend <cpu|metal|metal-fp16|metal-fast|metal-q8|metal-q4|"
-        "cuda[:N]>  (default: best built)\n"
+        "cuda[:N]|cuda-q8|cuda-q4>  (default: best built)\n"
         "  --max-tokens <N>       (default 512)\n"
         "  --temperature <T>      (default 0 = greedy)\n"
         "  --system \"<text>\"      optional system prompt\n"
@@ -168,8 +168,18 @@ int RunGenerate(int argc, char** argv) {
     } else if (backend.rfind("cuda", 0) == 0) {
 #ifdef LYKURO_HAVE_CUDA
         CudaModelOptions co;
-        auto p = backend.find(':');
-        if (p != std::string::npos) co.device_id = std::atoi(backend.c_str() + p + 1);
+        std::string cb = backend;
+        auto p = cb.find(':');
+        if (p != std::string::npos) {
+            co.device_id = std::atoi(cb.c_str() + p + 1);
+            cb = cb.substr(0, p);
+        }
+        if (cb == "cuda-q8") co.quantization = WeightQuant::kInt8;
+        else if (cb == "cuda-q4") co.quantization = WeightQuant::kInt4;
+        else if (cb != "cuda") {
+            std::fprintf(stderr, "unknown backend: %s\n", backend.c_str());
+            return 1;
+        }
         auto c = QwenCudaModel::Load(loaded.artifact.manifest,
                                      *loaded.artifact.weights, co);
         if (!c.status.ok()) {
