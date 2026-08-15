@@ -363,7 +363,11 @@ void HandleOllamaPull(int fd, const json::Value* root) {
     BeginChunked(fd, "application/x-ndjson");
     SendChunk(fd, "{\"status\":\"pulling " + JsonEsc(name) + "\"}\n");
     int rc = cli::PullModel(name, cli::DefaultModelDir(name));
-    if (rc != 0)
+    if (rc == 2)
+        SendChunk(fd,
+                  "{\"error\":\"unknown model: not local and not a valid "
+                  "HF repo id (owner/name)\"}\n");
+    else if (rc != 0)
         SendChunk(fd, "{\"error\":\"pull failed\"}\n");
     else
         SendChunk(fd, "{\"status\":\"success\"}\n");

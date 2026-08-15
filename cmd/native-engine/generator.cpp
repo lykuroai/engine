@@ -50,6 +50,21 @@ std::string DefaultModelDir(const std::string& repo) {
 }
 
 int PullModel(const std::string& repo, const std::string& out) {
+    // Already-local names succeed as a no-op (Ollama-style semantics). This
+    // also makes the names `list` / /api/tags report — local directory
+    // names like "Qwen_Qwen2.5-0.5B-Instruct", which are not valid HF
+    // repo ids — round-trip through pull.
+    if (fs::exists(fs::path(out) / "manifest.json")) {
+        std::fprintf(stderr, "already local: %s\n", out.c_str());
+        return 0;
+    }
+    if (repo.find('/') == std::string::npos) {
+        const std::string local = DefaultModelDir(repo);
+        if (fs::exists(fs::path(local) / "manifest.json")) {
+            std::fprintf(stderr, "already local: %s\n", local.c_str());
+            return 0;
+        }
+    }
     if (!LooksLikeHfRepo(repo)) {
         std::fprintf(stderr, "invalid repo id: %s\n", repo.c_str());
         return 2;

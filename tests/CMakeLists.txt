@@ -22,6 +22,8 @@ add_executable(unit_tests
     unit/metrics_test.cpp
     testutil/tiny_model.cpp
     integration/engine_test.cpp
+    unit/pull_local_test.cpp
+    ${CMAKE_SOURCE_DIR}/cmd/native-engine/generator.cpp
 )
 target_link_libraries(unit_tests
     PRIVATE lykuro_core lykuro_engine lykuro_model lykuro_security
