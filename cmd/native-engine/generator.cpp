@@ -84,6 +84,15 @@ int PullModel(const std::string& repo, const std::string& out) {
 
 int ResolveModelArg(std::string& dir) {
     if (fs::exists(fs::path(dir) / "manifest.json")) return 0;
+    // A bare local name as listed by `/v1/models` and `/api/tags`
+    // (e.g. "Qwen_Qwen2.5-1.5B-Instruct") resolves under ~/.lykuro/models.
+    if (dir.find('/') == std::string::npos) {
+        std::string local = DefaultModelDir(dir);
+        if (fs::exists(fs::path(local) / "manifest.json")) {
+            dir = local;
+            return 0;
+        }
+    }
     if (LooksLikeHfRepo(dir)) {
         std::string resolved = DefaultModelDir(dir);
         if (!fs::exists(fs::path(resolved) / "manifest.json")) {
