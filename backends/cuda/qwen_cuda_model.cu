@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <type_traits>
 #include <typeinfo>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "backends/cpu/cpu_backend.h"
@@ -2040,15 +2042,6 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
     Impl& impl = *model->impl_;
     impl.tied = c.tie_word_embeddings;
 
-    auto up_w = [&](const std::string& name, WeightBuffer& dst) {
-        if (result.status.ok()) {
-            result.status =
-                dst.Upload(weights, name, options.quantization);
-        }
-    };
-    auto up_native = [&](const std::string& name, WeightBuffer& dst) {
-        if (result.status.ok()) result.status = dst.Upload(weights, name);
-    };
     auto up_f = [&](const std::string& name, DeviceBuffer& dst) {
         if (result.status.ok()) {
             result.status = UploadF32(weights, name, dst);
@@ -2059,36 +2052,105 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
     // in quantized modes the lm head additionally gets a quantized copy
     // for the decode logits projection (same policy the Metal backend
     // ships as metal-q8/q4).
-    up_native("model.embed_tokens.weight", impl.embed);
-    if (options.quantization != WeightQuant::kNone &&
-        result.status.ok()) {
-        result.status = impl.head_q.Upload(
-            weights,
-            c.tie_word_embeddings ? "model.embed_tokens.weight"
-                                  : "lm_head.weight",
-            options.quantization);
-    }
+    //
+    // Per-layer conversion/quantization/upload runs on a thread pool
+    // (the safetensors mapping is read-only, the CUDA runtime is
+    // thread-safe once each worker binds the device) — a multi-GB first
+    // load was single-core.
     impl.layers.resize(c.num_layers);
-    for (uint32_t l = 0; l < c.num_layers; ++l) {
-        const std::string p = "model.layers." + std::to_string(l) + ".";
-        Impl::Layer& layer = impl.layers[l];
-        up_f(p + "input_layernorm.weight", layer.input_norm);
-        up_w(p + "self_attn.q_proj.weight", layer.q_w);
-        up_f(p + "self_attn.q_proj.bias", layer.q_b);
-        up_w(p + "self_attn.k_proj.weight", layer.k_w);
-        up_f(p + "self_attn.k_proj.bias", layer.k_b);
-        up_w(p + "self_attn.v_proj.weight", layer.v_w);
-        up_f(p + "self_attn.v_proj.bias", layer.v_b);
-        up_w(p + "self_attn.o_proj.weight", layer.o_w);
-        up_f(p + "post_attention_layernorm.weight", layer.post_norm);
-        up_w(p + "mlp.gate_proj.weight", layer.gate_w);
-        up_w(p + "mlp.up_proj.weight", layer.up_w);
-        up_w(p + "mlp.down_proj.weight", layer.down_w);
+    {
+        std::vector<Status> layer_status(c.num_layers, Status::Ok());
+        Status embed_status = Status::Ok();
+        std::atomic<uint32_t> next{0};
+        std::atomic<bool> embed_taken{false};
+        auto load_layer = [&](uint32_t l) -> Status {
+            const std::string p =
+                "model.layers." + std::to_string(l) + ".";
+            Impl::Layer& layer = impl.layers[l];
+            Status st = UploadF32(weights, p + "input_layernorm.weight",
+                                  layer.input_norm);
+            if (st.ok())
+                st = layer.q_w.Upload(weights,
+                                      p + "self_attn.q_proj.weight",
+                                      options.quantization);
+            if (st.ok())
+                st = UploadF32(weights, p + "self_attn.q_proj.bias",
+                               layer.q_b);
+            if (st.ok())
+                st = layer.k_w.Upload(weights,
+                                      p + "self_attn.k_proj.weight",
+                                      options.quantization);
+            if (st.ok())
+                st = UploadF32(weights, p + "self_attn.k_proj.bias",
+                               layer.k_b);
+            if (st.ok())
+                st = layer.v_w.Upload(weights,
+                                      p + "self_attn.v_proj.weight",
+                                      options.quantization);
+            if (st.ok())
+                st = UploadF32(weights, p + "self_attn.v_proj.bias",
+                               layer.v_b);
+            if (st.ok())
+                st = layer.o_w.Upload(weights,
+                                      p + "self_attn.o_proj.weight",
+                                      options.quantization);
+            if (st.ok())
+                st = UploadF32(weights,
+                               p + "post_attention_layernorm.weight",
+                               layer.post_norm);
+            if (st.ok())
+                st = layer.gate_w.Upload(weights,
+                                         p + "mlp.gate_proj.weight",
+                                         options.quantization);
+            if (st.ok())
+                st = layer.up_w.Upload(weights, p + "mlp.up_proj.weight",
+                                       options.quantization);
+            if (st.ok())
+                st = layer.down_w.Upload(weights,
+                                         p + "mlp.down_proj.weight",
+                                         options.quantization);
+            return st;
+        };
+        auto load_embed = [&]() -> Status {
+            Status st = impl.embed.Upload(weights,
+                                          "model.embed_tokens.weight");
+            if (st.ok() && !c.tie_word_embeddings) {
+                st = impl.lm_head.Upload(weights, "lm_head.weight");
+            }
+            if (st.ok() && options.quantization != WeightQuant::kNone) {
+                st = impl.head_q.Upload(
+                    weights,
+                    c.tie_word_embeddings ? "model.embed_tokens.weight"
+                                          : "lm_head.weight",
+                    options.quantization);
+            }
+            return st;
+        };
+        const uint32_t nthreads = std::max(
+            1u, std::min(std::thread::hardware_concurrency(),
+                         c.num_layers + 1));
+        std::vector<std::thread> pool_threads;
+        pool_threads.reserve(nthreads);
+        for (uint32_t t = 0; t < nthreads; ++t) {
+            pool_threads.emplace_back([&]() {
+                cudaSetDevice(options.device_id);
+                if (!embed_taken.exchange(true)) {
+                    embed_status = load_embed();
+                }
+                for (uint32_t l;
+                     (l = next.fetch_add(1)) < c.num_layers;) {
+                    layer_status[l] = load_layer(l);
+                }
+            });
+        }
+        for (auto& th : pool_threads) th.join();
+        for (uint32_t l = 0;
+             l < c.num_layers && result.status.ok(); ++l) {
+            result.status = layer_status[l];
+        }
+        if (result.status.ok()) result.status = embed_status;
     }
     up_f("model.norm.weight", impl.final_norm);
-    if (!c.tie_word_embeddings) {
-        up_native("lm_head.weight", impl.lm_head);
-    }
     if (!result.status.ok()) return result;
 
     // Paged KV pool (spec §16.3). Default capacity: 4x max context.
