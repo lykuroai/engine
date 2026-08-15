@@ -54,11 +54,25 @@ __device__ inline float LoadWeight(const __nv_bfloat16* w, size_t i) {
 // Weight accessors: uniform Load(row, i) view over f32 / bf16 / int8 /
 // int4 storage. Quantized loads dequantize in registers; accumulation
 // stays FP32 with fixed order, so quantized runs are still deterministic.
+// Load8(row, i0, out): eight consecutive elements per call with one
+// wide (coalesced) memory transaction. Per-element scalar loads were
+// the decode bottleneck for the quantized formats: a warp of byte-wise
+// nibble reads touches 16 useful bytes per 32-lane transaction, an 8x
+// DRAM amplification. i0 must be 8-aligned; every reduction dim the
+// engine feeds through here is a multiple of 8.
 struct F32Weight {
     const float* w;
     int in_dim;
     __device__ float Load(size_t row, int i) const {
         return w[row * in_dim + i];
+    }
+    __device__ void Load8(size_t row, int i0, float* o) const {
+        const float4* p =
+            reinterpret_cast<const float4*>(w + row * in_dim + i0);
+        const float4 a = p[0];
+        const float4 b = p[1];
+        o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w;
+        o[4] = b.x; o[5] = b.y; o[6] = b.z; o[7] = b.w;
     }
 };
 struct Bf16Weight {
@@ -67,6 +81,16 @@ struct Bf16Weight {
     __device__ float Load(size_t row, int i) const {
         return __bfloat162float(w[row * in_dim + i]);
     }
+    __device__ void Load8(size_t row, int i0, float* o) const {
+        const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(
+            w + row * in_dim + i0);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __bfloat1622float2(p[j]);
+            o[2 * j] = f.x;
+            o[2 * j + 1] = f.y;
+        }
+    }
 };
 struct Int8Weight {
     const int8_t* w;
@@ -74,6 +98,16 @@ struct Int8Weight {
     int in_dim;
     __device__ float Load(size_t row, int i) const {
         return float(w[row * in_dim + i]) * scales[row];
+    }
+    __device__ void Load8(size_t row, int i0, float* o) const {
+        const uint2 u = *reinterpret_cast<const uint2*>(
+            w + row * in_dim + i0);
+        const float s = scales[row];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            o[j] = float(int(int8_t((u.x >> (8 * j)) & 0xFFu))) * s;
+            o[4 + j] = float(int(int8_t((u.y >> (8 * j)) & 0xFFu))) * s;
+        }
     }
 };
 constexpr int kQuantGroup = 128;
@@ -88,6 +122,15 @@ struct Int4Weight {
         const int nib = (idx & 1) ? (byte >> 4) : (byte & 0xF);
         return float(nib - 8) *
                scales[row * groups_per_row + i / kQuantGroup];
+    }
+    __device__ void Load8(size_t row, int i0, float* o) const {
+        const uint32_t u = *reinterpret_cast<const uint32_t*>(
+            packed + ((row * in_dim + i0) >> 1));
+        const float s = scales[row * groups_per_row + i0 / kQuantGroup];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            o[j] = float(int((u >> (4 * j)) & 0xFu) - 8) * s;
+        }
     }
 };
 
@@ -598,12 +641,25 @@ __global__ void FusedQkvKernel(
     float acc[B];
 #pragma unroll
     for (int b = 0; b < B; ++b) acc[b] = 0.0f;
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const float wv = w.Load(local, i);
-        const float nw = norm_w[i];
+    const int chunks = in_dim >> 3;
+    for (int ci = threadIdx.x; ci < chunks; ci += blockDim.x) {
+        const int i0 = ci << 3;
+        float wv[8];
+        w.Load8(local, i0, wv);
+        const float4* nwp =
+            reinterpret_cast<const float4*>(norm_w + i0);
+        const float4 n0 = nwp[0];
+        const float4 n1 = nwp[1];
 #pragma unroll
         for (int b = 0; b < B; ++b) {
-            acc[b] += wv * (x[size_t(b) * in_dim + i] * nw);
+            const float4* xp = reinterpret_cast<const float4*>(
+                x + size_t(b) * in_dim + i0);
+            const float4 x0 = xp[0];
+            const float4 x1 = xp[1];
+            acc[b] += wv[0] * (x0.x * n0.x) + wv[1] * (x0.y * n0.y) +
+                      wv[2] * (x0.z * n0.z) + wv[3] * (x0.w * n0.w) +
+                      wv[4] * (x1.x * n1.x) + wv[5] * (x1.y * n1.y) +
+                      wv[6] * (x1.z * n1.z) + wv[7] * (x1.w * n1.w);
         }
     }
 #pragma unroll
@@ -640,15 +696,33 @@ __global__ void FusedGateUpSwigluKernel(
         accg[b] = 0.0f;
         accu[b] = 0.0f;
     }
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const float gw = gate_w.Load(row, i);
-        const float uw = up_w.Load(row, i);
-        const float nw = norm_w[i];
+    const int chunks = in_dim >> 3;
+    for (int ci = threadIdx.x; ci < chunks; ci += blockDim.x) {
+        const int i0 = ci << 3;
+        float gw[8];
+        float uw[8];
+        gate_w.Load8(row, i0, gw);
+        up_w.Load8(row, i0, uw);
+        const float4* nwp = reinterpret_cast<const float4*>(norm_w + i0);
+        const float4 n0 = nwp[0];
+        const float4 n1 = nwp[1];
+        const float nw[8] = {n0.x, n0.y, n0.z, n0.w,
+                             n1.x, n1.y, n1.z, n1.w};
 #pragma unroll
         for (int b = 0; b < B; ++b) {
-            const float xn = x[size_t(b) * in_dim + i] * nw;
-            accg[b] += gw * xn;
-            accu[b] += uw * xn;
+            const float4* xp = reinterpret_cast<const float4*>(
+                x + size_t(b) * in_dim + i0);
+            const float4 x0 = xp[0];
+            const float4 x1 = xp[1];
+            const float xn[8] = {x0.x * nw[0], x0.y * nw[1],
+                                 x0.z * nw[2], x0.w * nw[3],
+                                 x1.x * nw[4], x1.y * nw[5],
+                                 x1.z * nw[6], x1.w * nw[7]};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                accg[b] += gw[j] * xn[j];
+                accu[b] += uw[j] * xn[j];
+            }
         }
     }
 #pragma unroll
@@ -692,12 +766,30 @@ __global__ void MatVecEpilogueKernel(
     float acc[B];
 #pragma unroll
     for (int b = 0; b < B; ++b) acc[b] = 0.0f;
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const float wv = w.Load(row, i);
-        const float nw = FoldNorm ? norm_w[i] : 1.0f;
+    const int chunks = in_dim >> 3;
+    for (int ci = threadIdx.x; ci < chunks; ci += blockDim.x) {
+        const int i0 = ci << 3;
+        float wv[8];
+        w.Load8(row, i0, wv);
+        float nw[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+        if (FoldNorm) {
+            const float4* nwp =
+                reinterpret_cast<const float4*>(norm_w + i0);
+            const float4 n0 = nwp[0];
+            const float4 n1 = nwp[1];
+            nw[0] = n0.x; nw[1] = n0.y; nw[2] = n0.z; nw[3] = n0.w;
+            nw[4] = n1.x; nw[5] = n1.y; nw[6] = n1.z; nw[7] = n1.w;
+        }
 #pragma unroll
         for (int b = 0; b < B; ++b) {
-            acc[b] += wv * (x[size_t(b) * in_dim + i] * nw);
+            const float4* xp = reinterpret_cast<const float4*>(
+                x + size_t(b) * in_dim + i0);
+            const float4 x0 = xp[0];
+            const float4 x1 = xp[1];
+            acc[b] += wv[0] * (x0.x * nw[0]) + wv[1] * (x0.y * nw[1]) +
+                      wv[2] * (x0.z * nw[2]) + wv[3] * (x0.w * nw[3]) +
+                      wv[4] * (x1.x * nw[4]) + wv[5] * (x1.y * nw[5]) +
+                      wv[6] * (x1.z * nw[6]) + wv[7] * (x1.w * nw[7]);
         }
     }
 #pragma unroll
@@ -1415,10 +1507,19 @@ struct QwenCudaModel::Impl {
     };
 
     WeightBuffer embed;
+    // Quantized copy of the lm head (decode logits projection). The
+    // embedding table itself stays checkpoint-dtype for lookups; the
+    // Metal backend shipped a quantized head with parity-tested quality,
+    // and BF16 head reads were the single largest decode cost.
+    WeightBuffer head_q;
     std::vector<Layer> layers;
     DeviceBuffer final_norm;
     WeightBuffer lm_head;
     bool tied = true;
+    const WeightBuffer& head() const {
+        if (head_q.buf.ptr != nullptr) return head_q;
+        return tied ? embed : lm_head;
+    }
 
     KvPool pool;
     uint64_t prefix_hit_tokens = 0;
@@ -1542,7 +1643,7 @@ void RunFusedDecode(QwenCudaModel::Impl& impl, const QwenConfig& c,
     NormScaleKernel<<<B, 256, 0, stream>>>(impl.x_rows.f32(),
                                            c.rms_norm_eps, h,
                                            impl.d_norm_scales.f32());
-    const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+    const WeightBuffer& head = impl.head();
     LaunchMatVecEpiB<B, false, true>(head, impl.x_rows.f32(),
                                      impl.final_norm.f32(),
                                      impl.d_norm_scales.f32(), h,
@@ -1697,9 +1798,19 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
         }
     };
 
-    // embed / lm_head keep the checkpoint dtype: logits precision is not
-    // sacrificed to weight quantization.
+    // The embedding table keeps the checkpoint dtype (lookup quality);
+    // in quantized modes the lm head additionally gets a quantized copy
+    // for the decode logits projection (same policy the Metal backend
+    // ships as metal-q8/q4).
     up_native("model.embed_tokens.weight", impl.embed);
+    if (options.quantization != WeightQuant::kNone &&
+        result.status.ok()) {
+        result.status = impl.head_q.Upload(
+            weights,
+            c.tie_word_embeddings ? "model.embed_tokens.weight"
+                                  : "lm_head.weight",
+            options.quantization);
+    }
     impl.layers.resize(c.num_layers);
     for (uint32_t l = 0; l < c.num_layers; ++l) {
         const std::string p = "model.layers." + std::to_string(l) + ".";
@@ -1937,7 +2048,7 @@ Status QwenCudaModel::ForwardToken(uint32_t token, uint32_t pos,
     if (want_logits) {
         RmsNormKernel<<<1, 256>>>(impl.hidden.f32(), impl.final_norm.f32(),
                                   c.rms_norm_eps, h, impl.normed.f32());
-        const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+        const WeightBuffer& head = impl.head();
         LaunchMatVec(head, impl.normed.f32(), nullptr, h,
                      int(c.vocab_size), impl.logits.f32());
         logits_out.resize(c.vocab_size);
@@ -2057,7 +2168,7 @@ Status QwenCudaModel::ForwardChunk(const uint32_t* tokens, uint32_t n,
         const float* last_hidden = impl.x_rows.f32() + size_t(n - 1) * h;
         RmsNormKernel<<<1, 256>>>(last_hidden, impl.final_norm.f32(),
                                   c.rms_norm_eps, h, impl.normed.f32());
-        const WeightBuffer& head = impl.tied ? impl.embed : impl.lm_head;
+        const WeightBuffer& head = impl.head();
         LaunchMatVec(head, impl.normed.f32(), nullptr, h,
                      int(c.vocab_size), impl.logits.f32());
         logits_out.resize(c.vocab_size);
@@ -2430,8 +2541,7 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
             RmsNormRowsKernel<<<nb, 256, 0, stream>>>(
                 impl.x_rows.f32(), impl.final_norm.f32(), c.rms_norm_eps,
                 h, impl.xn_rows.f32());
-            const WeightBuffer& head =
-                impl.tied ? impl.embed : impl.lm_head;
+            const WeightBuffer& head = impl.head();
             project(impl.xn_rows.f32(), head, nullptr, h,
                     int(c.vocab_size), impl.batch_logits.f32(),
                     int(c.vocab_size));
