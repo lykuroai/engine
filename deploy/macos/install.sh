@@ -12,7 +12,7 @@
 # (default /usr/local/bin), LYKURO_SHA256 (verify the download).
 set -euo pipefail
 
-VERSION="${LYKURO_VERSION:-v1.0.4}"
+VERSION="${LYKURO_VERSION:-v1.0.5}"
 PREFIX="${LYKURO_PREFIX:-/usr/local/bin}"
 ASSET="lykuro-native-engine-macos-arm64"
 DEST="$PREFIX/native-engine"

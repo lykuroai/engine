@@ -1,5 +1,20 @@
 # Release Notes
 
+## v1.0.5 (2026-08-15)
+
+Model-name consistency across every surface:
+
+- `list`, `GET /api/tags` and `GET /v1/models` now report the canonical
+  HF repo id ("Qwen/Qwen2.5-0.5B-Instruct") instead of the local
+  directory name, so the listed name is byte-identical to what `pull`
+  and `run` take. `pull` records the repo id in a `source_repo` sidecar;
+  without one it is derived from the directory name (HF owner names
+  cannot contain '_'), and a name is only displayed if it resolves back
+  to the same artifact. Directory-name input keeps working everywhere.
+- `pull` (CLI and POST /api/pull) treats an already-local model as a
+  no-op success, Ollama-style — previously feeding a listed name back
+  to pull failed with "invalid repo id".
+
 ## v1.0.4 (2026-08-15)
 
 ### CUDA decode overhaul — ahead of Ollama on RTX 3060
