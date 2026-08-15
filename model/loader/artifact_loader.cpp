@@ -179,6 +179,13 @@ ArtifactLoadResult LoadArtifact(const std::string& artifact_dir,
     result.status = result.artifact.weights->Open(weights_path);
     if (!result.status.ok()) return result;
 
+    if (options.skip_reference_model) {
+        // Caller replaces the model with a GPU backend whose Load
+        // pre-warms a forward pass; digest/manifest/tokenizer checks
+        // above still gate the artifact.
+        result.status = Status::Ok();
+        return result;
+    }
     auto model = QwenModel::Load(m, *result.artifact.weights);
     if (!model.status.ok()) {
         result.status = model.status;

@@ -123,6 +123,7 @@ int RunGenerate(int argc, char** argv) {
 
     ArtifactLoadOptions opt;
     opt.allow_unsigned_dev = true;  // local eval; no signing config here
+    opt.skip_reference_model = (backend != "cpu");
     ArtifactLoadResult loaded = LoadArtifact(dir, opt);
     if (!loaded.status.ok()) {
         std::fprintf(stderr, "load failed: %s\n",

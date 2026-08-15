@@ -1,6 +1,7 @@
 #include "cmd/native-engine/generator.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -165,7 +166,20 @@ Status LoadSession(const std::string& dir_in, const std::string& backend_in,
 
     ArtifactLoadOptions opt;
     opt.allow_unsigned_dev = true;
+    // A GPU backend replaces the model anyway; building the CPU
+    // reference (a full BF16->FP32 conversion plus a CPU smoke forward)
+    // doubled the load time of every first request.
+    opt.skip_reference_model = (out.backend != "cpu");
+    const bool prof = std::getenv("LYKURO_LOAD_PROF") != nullptr;
+    auto t0 = std::chrono::steady_clock::now();
     out.loaded = LoadArtifact(dir, opt);
+    if (prof) {
+        std::fprintf(stderr, "[load] artifact verify+open: %.2fs\n",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+        t0 = std::chrono::steady_clock::now();
+    }
     if (!out.loaded.status.ok()) return out.loaded.status;
     out.model = std::move(out.loaded.artifact.model);
 
@@ -223,6 +237,12 @@ Status LoadSession(const std::string& dir_in, const std::string& backend_in,
     } else if (b != "cpu") {
         return Status(ErrorCode::kInvalidRequest, "unknown backend: " + b,
                       "generator");
+    }
+    if (prof) {
+        std::fprintf(stderr, "[load] backend model build: %.2fs\n",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
     }
     return Status::Ok();
 }

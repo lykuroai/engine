@@ -25,6 +25,9 @@ public:
 
 private:
     void ProcessBlock(const uint8_t* block);
+    // Bulk path: hardware SHA extensions (ARMv8 SHA2 / x86 SHA-NI) when
+    // available, portable rounds otherwise.
+    void ProcessBlocks(const uint8_t* p, size_t nblocks);
 
     std::array<uint32_t, 8> state_;
     std::array<uint8_t, 64> buffer_;

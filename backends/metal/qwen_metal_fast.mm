@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "backends/cpu/cpu_backend.h"
@@ -2193,24 +2194,40 @@ QwenMetalFastModel::LoadResult QwenMetalFastModel::Load(
 
         impl.layers.resize(c.num_layers);
         Status s = Status::Ok();
-        std::vector<float> tmp;
-        for (uint32_t l = 0; l < c.num_layers && s.ok(); ++l) {
+
+        // Per-layer conversion + quantization + upload is embarrassingly
+        // parallel (SafetensorsFile is a read-only mapping and
+        // newBufferWithBytes is thread-safe); a first request that has
+        // to load a multi-GB model was paying for all of it on one core.
+        auto load_layer = [&](uint32_t l) -> Status {
             const std::string p = "model.layers." + std::to_string(l) + ".";
             Impl::Layer& L = impl.layers[l];
-            s = TensorToHost(weights, p + "input_layernorm.weight", host);
-            if (s.ok() && !upload_f32(host, L.input_norm)) s = oom();
-            if (s.ok()) {
-                s = TensorToHost(weights, p + "post_attention_layernorm.weight",
-                                 host);
+            std::vector<float> lhost;
+            std::vector<float> ltmp;
+            auto upload_f32l = [&](const std::vector<float>& v,
+                                   id<MTLBuffer> __strong& buf) -> bool {
+                buf = [impl.device
+                    newBufferWithBytes:v.data()
+                                length:v.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+                return buf != nil;
+            };
+            auto oom_l = [&]() {
+                return Status(ErrorCode::kGpuOom, "weight upload failed",
+                              kComponent);
+            };
+            Status st = TensorToHost(weights, p + "input_layernorm.weight",
+                                     lhost);
+            if (st.ok() && !upload_f32l(lhost, L.input_norm)) st = oom_l();
+            if (st.ok()) {
+                st = TensorToHost(weights,
+                                  p + "post_attention_layernorm.weight",
+                                  lhost);
             }
-            if (s.ok() && !upload_f32(host, L.post_norm)) s = oom();
+            if (st.ok() && !upload_f32l(lhost, L.post_norm)) st = oom_l();
 
-            // Fused QKV in ROTATION-PAIR order: the q section emits rows
-            // as (head*hd+i, head*hd+i+hd/2) pairs, k likewise, v rows
-            // unchanged — the dual-row GEMV simdgroup then owns exactly
-            // one RoPE pair and rotates in its epilogue. The fused bias
-            // is permuted identically.
-            if (s.ok()) {
+            // Fused QKV in ROTATION-PAIR order (see EncodeStep).
+            if (st.ok()) {
                 const uint32_t half_hd = c.head_dim / 2;
                 std::vector<float> fused;
                 std::vector<float> fused_bias;
@@ -2235,99 +2252,158 @@ QwenMetalFastModel::LoadResult QwenMetalFastModel::Load(
                     }
                 };
                 std::vector<float> wq, wk, wv, bq, bk, bv;
-                s = TensorToHost(weights, p + "self_attn.q_proj.weight", wq);
-                if (s.ok())
-                    s = TensorToHost(weights, p + "self_attn.k_proj.weight",
-                                     wk);
-                if (s.ok())
-                    s = TensorToHost(weights, p + "self_attn.v_proj.weight",
-                                     wv);
-                if (s.ok())
-                    s = TensorToHost(weights, p + "self_attn.q_proj.bias",
-                                     bq);
-                if (s.ok())
-                    s = TensorToHost(weights, p + "self_attn.k_proj.bias",
-                                     bk);
-                if (s.ok())
-                    s = TensorToHost(weights, p + "self_attn.v_proj.bias",
-                                     bv);
-                if (s.ok()) {
+                st = TensorToHost(weights, p + "self_attn.q_proj.weight",
+                                  wq);
+                if (st.ok())
+                    st = TensorToHost(weights,
+                                      p + "self_attn.k_proj.weight", wk);
+                if (st.ok())
+                    st = TensorToHost(weights,
+                                      p + "self_attn.v_proj.weight", wv);
+                if (st.ok())
+                    st = TensorToHost(weights, p + "self_attn.q_proj.bias",
+                                      bq);
+                if (st.ok())
+                    st = TensorToHost(weights, p + "self_attn.k_proj.bias",
+                                      bk);
+                if (st.ok())
+                    st = TensorToHost(weights, p + "self_attn.v_proj.bias",
+                                      bv);
+                if (st.ok()) {
                     append_paired(wq, bq, c.num_heads);
                     append_paired(wk, bk, c.num_kv_heads);
                     fused.insert(fused.end(), wv.begin(), wv.end());
                     fused_bias.insert(fused_bias.end(), bv.begin(),
                                       bv.end());
+                    std::vector<uint16_t> bias_h(fused_bias.size());
+                    for (size_t i = 0; i < fused_bias.size(); ++i) {
+                        bias_h[i] = FloatToFp16(fused_bias[i]);
+                    }
+                    L.qkv_bias = [impl.device
+                        newBufferWithBytes:bias_h.data()
+                                    length:bias_h.size() * 2
+                                   options:MTLResourceStorageModeShared];
                     if (!impl.LoadMat(fused, q_dim + 2 * kv_dim, h, L.qkv,
                                       false) ||
-                        !upload_f16(fused_bias, L.qkv_bias)) {
-                        s = oom();
+                        L.qkv_bias == nil) {
+                        st = oom_l();
                     }
                 }
             }
-            if (s.ok()) {
-                s = TensorToHost(weights, p + "self_attn.o_proj.weight", tmp);
-                if (s.ok() && !impl.LoadMat(tmp, h, q_dim, L.ow, false)) {
-                    s = oom();
+            if (st.ok()) {
+                st = TensorToHost(weights, p + "self_attn.o_proj.weight",
+                                  ltmp);
+                if (st.ok() && !impl.LoadMat(ltmp, h, q_dim, L.ow, false)) {
+                    st = oom_l();
                 }
             }
-            // Fused gate/up, ROW-INTERLEAVED (2j = gate_j, 2j+1 = up_j)
-            // so one dual-row simdgroup computes the SiLU pair.
-            if (s.ok()) {
+            // Fused gate/up, ROW-INTERLEAVED (2j = gate_j, 2j+1 = up_j).
+            if (st.ok()) {
                 std::vector<float> gate_h;
-                s = TensorToHost(weights, p + "mlp.gate_proj.weight", gate_h);
-                if (s.ok()) {
-                    s = TensorToHost(weights, p + "mlp.up_proj.weight", tmp);
+                st = TensorToHost(weights, p + "mlp.gate_proj.weight",
+                                  gate_h);
+                if (st.ok()) {
+                    st = TensorToHost(weights, p + "mlp.up_proj.weight",
+                                      ltmp);
                 }
-                if (s.ok()) {
-                    std::vector<float> fused(size_t(2 * c.intermediate_size) *
-                                             h);
+                if (st.ok()) {
+                    std::vector<float> fused(
+                        size_t(2 * c.intermediate_size) * h);
                     for (uint32_t j = 0; j < c.intermediate_size; ++j) {
                         std::memcpy(fused.data() + size_t(2 * j) * h,
                                     gate_h.data() + size_t(j) * h,
                                     h * sizeof(float));
                         std::memcpy(fused.data() + size_t(2 * j + 1) * h,
-                                    tmp.data() + size_t(j) * h,
+                                    ltmp.data() + size_t(j) * h,
                                     h * sizeof(float));
                     }
                     if (!impl.LoadMat(fused, 2 * c.intermediate_size, h,
                                       L.gate_up, false)) {
-                        s = oom();
+                        st = oom_l();
                     }
                 }
             }
-            if (s.ok()) {
-                s = TensorToHost(weights, p + "mlp.down_proj.weight", tmp);
-                if (s.ok() && !impl.LoadMat(tmp, h, c.intermediate_size,
-                                            L.down, false)) {
-                    s = oom();
+            if (st.ok()) {
+                st = TensorToHost(weights, p + "mlp.down_proj.weight",
+                                  ltmp);
+                if (st.ok() && !impl.LoadMat(ltmp, h, c.intermediate_size,
+                                             L.down, false)) {
+                    st = oom_l();
                 }
             }
+            return st;
+        };
+
+        // Embedding table + lm head (the largest single conversions) run
+        // as one more parallel task.
+        Status embed_status = Status::Ok();
+        auto load_embed = [&]() -> Status {
+            std::vector<float> embed;
+            Status st = TensorToHost(weights, "model.embed_tokens.weight",
+                                     embed);
+            if (!st.ok()) return st;
+            impl.embed_fp16.resize(embed.size());
+            for (size_t i = 0; i < embed.size(); ++i) {
+                impl.embed_fp16[i] = FloatToFp16(embed[i]);
+            }
+            if (c.tie_word_embeddings) {
+                if (!impl.LoadMat(embed, c.vocab_size, h, impl.head,
+                                  true)) {
+                    return Status(ErrorCode::kGpuOom,
+                                  "weight upload failed", kComponent);
+                }
+            } else {
+                std::vector<float> headw;
+                st = TensorToHost(weights, "lm_head.weight", headw);
+                if (!st.ok()) return st;
+                if (!impl.LoadMat(headw, c.vocab_size, h, impl.head,
+                                  true)) {
+                    return Status(ErrorCode::kGpuOom,
+                                  "weight upload failed", kComponent);
+                }
+            }
+            impl.embed_gpu = [impl.device
+                newBufferWithBytes:impl.embed_fp16.data()
+                            length:impl.embed_fp16.size() * 2
+                           options:MTLResourceStorageModeShared];
+            if (impl.embed_gpu == nil) {
+                return Status(ErrorCode::kGpuOom, "weight upload failed",
+                              kComponent);
+            }
+            return Status::Ok();
+        };
+
+        {
+            std::vector<Status> layer_status(c.num_layers, Status::Ok());
+            std::atomic<uint32_t> next{0};
+            const uint32_t nthreads = std::max(
+                1u, std::min(std::thread::hardware_concurrency(),
+                             c.num_layers + 1));
+            std::vector<std::thread> pool;
+            pool.reserve(nthreads);
+            std::atomic<bool> embed_taken{false};
+            for (uint32_t t = 0; t < nthreads; ++t) {
+                pool.emplace_back([&]() {
+                    @autoreleasepool {
+                        if (!embed_taken.exchange(true)) {
+                            embed_status = load_embed();
+                        }
+                        for (uint32_t l;
+                             (l = next.fetch_add(1)) < c.num_layers;) {
+                            layer_status[l] = load_layer(l);
+                        }
+                    }
+                });
+            }
+            for (auto& th : pool) th.join();
+            for (uint32_t l = 0; l < c.num_layers && s.ok(); ++l) {
+                s = layer_status[l];
+            }
+            if (s.ok()) s = embed_status;
         }
+
         if (s.ok()) s = TensorToHost(weights, "model.norm.weight", host);
         if (s.ok() && !upload_f32(host, impl.final_norm)) s = oom();
-        if (s.ok()) {
-            std::vector<float> embed;
-            s = TensorToHost(weights, "model.embed_tokens.weight", embed);
-            if (s.ok()) {
-                impl.embed_fp16.resize(embed.size());
-                for (size_t i = 0; i < embed.size(); ++i) {
-                    impl.embed_fp16[i] = FloatToFp16(embed[i]);
-                }
-                if (c.tie_word_embeddings) {
-                    if (!impl.LoadMat(embed, c.vocab_size, h, impl.head,
-                                      true)) {
-                        s = oom();
-                    }
-                } else {
-                    std::vector<float> head;
-                    s = TensorToHost(weights, "lm_head.weight", head);
-                    if (s.ok() && !impl.LoadMat(head, c.vocab_size, h,
-                                                impl.head, true)) {
-                        s = oom();
-                    }
-                }
-            }
-        }
 
         // Activation buffers.
         if (s.ok()) {
@@ -2356,10 +2432,7 @@ QwenMetalFastModel::LoadResult QwenMetalFastModel::Load(
                               sizeof(float));
             impl.at_a = alloc(size_t(c.num_heads) * kAttnMaxSplit *
                               c.head_dim * sizeof(float));
-            impl.embed_gpu = [impl.device
-                newBufferWithBytes:impl.embed_fp16.data()
-                            length:impl.embed_fp16.size() * 2
-                           options:MTLResourceStorageModeShared];
+            // embed_gpu is created by the parallel load task above.
             if (impl.x == nil || impl.xn == nil || impl.q == nil ||
                 impl.attn_out == nil || impl.gate_a == nil ||
                 impl.up_a == nil || impl.act == nil || impl.logits == nil ||

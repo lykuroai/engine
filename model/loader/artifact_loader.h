@@ -22,6 +22,12 @@ struct ArtifactLoadOptions {
     bool allow_unsigned_dev = false;
     uint64_t max_manifest_bytes = 1 << 20;
     uint64_t max_tokenizer_bytes = 64ull << 20;
+    // Skip building the CPU reference model (and its CPU smoke
+    // inference). Set ONLY when the caller immediately replaces the
+    // model with a GPU backend whose own Load performs a pre-warm
+    // forward — that pre-warm is the smoke inference for the path that
+    // actually serves (spec §12.4 intent). artifact.model is null.
+    bool skip_reference_model = false;
 };
 
 struct LoadedArtifact {

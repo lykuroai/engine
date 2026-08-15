@@ -3,6 +3,16 @@
 #include <cassert>
 #include <cstring>
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SHA2)
+#include <arm_neon.h>
+#define LYKURO_SHA256_ARM 1
+#endif
+#if defined(__x86_64__)
+#include <cpuid.h>
+#include <immintrin.h>
+#define LYKURO_SHA256_X86 1
+#endif
+
 namespace lykuro::nie {
 
 namespace {
@@ -63,6 +73,122 @@ void Sha256::ProcessBlock(const uint8_t* block) {
     state_[4] += e; state_[5] += f; state_[6] += g; state_[7] += h;
 }
 
+#ifdef LYKURO_SHA256_ARM
+// FIPS 180-4 compression via the ARMv8 SHA2 instructions. Same in-tree
+// implementation policy as the portable rounds — only the CPU's crypto
+// unit does the arithmetic. ~5x the portable throughput, which matters
+// because every model load digests multi-GB weight files.
+static void ProcessBlocksArm(std::array<uint32_t, 8>& state,
+                             const uint8_t* p, size_t n) {
+    uint32x4_t s0 = vld1q_u32(state.data());
+    uint32x4_t s1 = vld1q_u32(state.data() + 4);
+    while (n-- > 0) {
+        const uint32x4_t save0 = s0;
+        const uint32x4_t save1 = s1;
+        uint32x4_t m[4];
+        for (int i = 0; i < 4; ++i) {
+            m[i] = vreinterpretq_u32_u8(
+                vrev32q_u8(vld1q_u8(p + 16 * i)));
+        }
+        p += 64;
+        for (int q = 0; q < 16; ++q) {
+            const uint32x4_t wk =
+                vaddq_u32(m[q & 3], vld1q_u32(&kK[4 * q]));
+            const uint32x4_t e0 = s0;
+            s0 = vsha256hq_u32(s0, s1, wk);
+            s1 = vsha256h2q_u32(s1, e0, wk);
+            if (q < 12) {
+                m[q & 3] = vsha256su1q_u32(
+                    vsha256su0q_u32(m[q & 3], m[(q + 1) & 3]),
+                    m[(q + 2) & 3], m[(q + 3) & 3]);
+            }
+        }
+        s0 = vaddq_u32(s0, save0);
+        s1 = vaddq_u32(s1, save1);
+    }
+    vst1q_u32(state.data(), s0);
+    vst1q_u32(state.data() + 4, s1);
+}
+#endif  // LYKURO_SHA256_ARM
+
+#ifdef LYKURO_SHA256_X86
+static bool HasShaNi() {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+    return (b & (1u << 29)) != 0;  // EBX bit 29: SHA
+}
+
+__attribute__((target("sha,sse4.1")))
+static void ProcessBlocksX86(std::array<uint32_t, 8>& state,
+                             const uint8_t* p, size_t n) {
+    // State layout for the SHA-NI instructions: ABEF / CDGH.
+    __m128i abcd = _mm_shuffle_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(state.data())),
+        0x1B);  // D C B A -> A B C D reversed
+    __m128i efgh = _mm_shuffle_epi32(
+        _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(state.data() + 4)),
+        0x1B);
+    __m128i abef = _mm_alignr_epi8(abcd, efgh, 8);
+    __m128i cdgh = _mm_blend_epi16(efgh, abcd, 0xF0);
+    const __m128i mask =
+        _mm_set_epi64x(0x0c0d0e0f08090a0bULL, 0x0405060700010203ULL);
+    while (n-- > 0) {
+        const __m128i save_abef = abef;
+        const __m128i save_cdgh = cdgh;
+        __m128i m[4];
+        for (int i = 0; i < 4; ++i) {
+            m[i] = _mm_shuffle_epi8(
+                _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(p + 16 * i)),
+                mask);
+        }
+        p += 64;
+        for (int q = 0; q < 16; ++q) {
+            __m128i wk = _mm_add_epi32(
+                m[q & 3], _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                              &kK[4 * q])));
+            cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk);
+            wk = _mm_shuffle_epi32(wk, 0x0E);
+            abef = _mm_sha256rnds2_epu32(abef, cdgh, wk);
+            if (q < 12) {
+                const __m128i tmp =
+                    _mm_alignr_epi8(m[(q + 3) & 3], m[(q + 2) & 3], 4);
+                m[q & 3] = _mm_sha256msg2_epu32(
+                    _mm_add_epi32(
+                        _mm_sha256msg1_epu32(m[q & 3], m[(q + 1) & 3]),
+                        tmp),
+                    m[(q + 3) & 3]);
+            }
+        }
+        abef = _mm_add_epi32(abef, save_abef);
+        cdgh = _mm_add_epi32(cdgh, save_cdgh);
+    }
+    __m128i abcd_out = _mm_shuffle_epi32(
+        _mm_alignr_epi8(abef, cdgh, 8), 0x1B);
+    __m128i efgh_out = _mm_shuffle_epi32(
+        _mm_blend_epi16(cdgh, abef, 0xF0), 0x1B);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state.data()), abcd_out);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state.data() + 4),
+                     efgh_out);
+}
+#endif  // LYKURO_SHA256_X86
+
+void Sha256::ProcessBlocks(const uint8_t* p, size_t nblocks) {
+#ifdef LYKURO_SHA256_ARM
+    ProcessBlocksArm(state_, p, nblocks);
+    return;
+#endif
+#ifdef LYKURO_SHA256_X86
+    static const bool has_sha = HasShaNi();
+    if (has_sha) {
+        ProcessBlocksX86(state_, p, nblocks);
+        return;
+    }
+#endif
+    for (size_t i = 0; i < nblocks; ++i) ProcessBlock(p + 64 * i);
+}
+
 void Sha256::Update(const void* data, size_t len) {
     assert(!finished_);
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -75,14 +201,15 @@ void Sha256::Update(const void* data, size_t len) {
         p += take;
         len -= take;
         if (buffer_len_ == buffer_.size()) {
-            ProcessBlock(buffer_.data());
+            ProcessBlocks(buffer_.data(), 1);
             buffer_len_ = 0;
         }
     }
-    while (len >= 64) {
-        ProcessBlock(p);
-        p += 64;
-        len -= 64;
+    if (len >= 64) {
+        const size_t nblocks = len / 64;
+        ProcessBlocks(p, nblocks);
+        p += nblocks * 64;
+        len -= nblocks * 64;
     }
     if (len > 0) {
         std::memcpy(buffer_.data(), p, len);
