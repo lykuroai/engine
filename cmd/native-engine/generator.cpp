@@ -8,6 +8,7 @@
 #include <fstream>
 
 #include "core/generation/sampler.h"
+#include "security/sha256.h"
 #include "model/convert/hf_convert.h"
 #include "model/tokenizer/bpe_tokenizer.h"
 #ifdef LYKURO_HAVE_METAL
@@ -98,16 +99,67 @@ int PullModel(const std::string& repo, const std::string& out) {
     std::error_code ec;
     const std::string tmp = out + "/.hf-download";
     fs::create_directories(tmp, ec);
+    // For LFS-backed files Hugging Face reports the upstream SHA-256 as
+    // the linked ETag; verifying the downloaded bytes against it catches
+    // silent download corruption BEFORE conversion bakes the corrupt
+    // bytes into an artifact whose own checksums would then verify.
+    auto expected_sha = [&](const std::string& url) -> std::string {
+        // x-linked-etag is the LFS object's SHA-256; the plain ETag on
+        // the CDN response is NOT the content hash.
+        const std::string cmd =
+            "curl -fsSLI '" + url +
+            "' | tr -d '\\r' | awk 'tolower($1)==\"x-linked-etag:\" "
+            "{gsub(/\"/, \"\", $2); print $2}' | tail -1";
+        FILE* p = popen(cmd.c_str(), "r");
+        if (p == nullptr) return "";
+        char buf[128] = {0};
+        if (fgets(buf, sizeof(buf), p) == nullptr) buf[0] = 0;
+        pclose(p);
+        std::string s(buf);
+        while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) {
+            s.pop_back();
+        }
+        // Only a 64-hex-char value is a usable SHA-256 (weak ETags and
+        // MD5-style ETags are ignored).
+        if (s.size() != 64) return "";
+        for (char ch : s) {
+            if (!std::isxdigit(static_cast<unsigned char>(ch))) return "";
+        }
+        return s;
+    };
     auto dl = [&](const char* file, bool required) -> bool {
         const std::string url =
             "https://huggingface.co/" + repo + "/resolve/main/" + file;
-        const std::string cmd = "curl -fSL --retry 3 -o '" + tmp + "/" + file +
-                                "' '" + url + "'";
+        const std::string path = tmp + "/" + file;
+        const std::string cmd =
+            "curl -fSL --retry 3 -o '" + path + "' '" + url + "'";
         std::fprintf(stderr, "pull: %s\n", file);
         int rc = std::system(cmd.c_str());
-        if (rc != 0 && required)
-            std::fprintf(stderr, "download failed: %s\n", file);
-        return rc == 0;
+        if (rc != 0) {
+            if (required)
+                std::fprintf(stderr, "download failed: %s\n", file);
+            return false;
+        }
+        const std::string want = expected_sha(url);
+        if (!want.empty()) {
+            std::ifstream f(path, std::ios::binary);
+            Sha256 hasher;
+            std::vector<char> buf(1 << 20);
+            while (f.read(buf.data(), std::streamsize(buf.size())) ||
+                   f.gcount() > 0) {
+                hasher.Update(buf.data(), size_t(f.gcount()));
+            }
+            const std::string got = Sha256::ToHex(hasher.Finish());
+            if (got != want) {
+                std::fprintf(stderr,
+                             "download corrupt: %s (sha256 %s != upstream "
+                             "%s); retry the pull\n",
+                             file, got.c_str(), want.c_str());
+                return false;
+            }
+            std::fprintf(stderr, "verified: %s (sha256 ok)\n", file);
+        }
+        return true;
     };
     if (!dl("config.json", true)) return 1;
     if (!dl("tokenizer.json", true)) return 1;
