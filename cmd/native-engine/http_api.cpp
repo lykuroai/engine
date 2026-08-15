@@ -14,6 +14,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <csignal>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -482,6 +484,10 @@ int RunHttpServe(int argc, char** argv) {
             host = argv[++i];
     }
     if (host == "*" || host.empty()) host = "0.0.0.0";
+
+    // A client aborting mid-stream must surface as EPIPE on write(),
+    // not kill the whole server with SIGPIPE.
+    std::signal(SIGPIPE, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
