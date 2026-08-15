@@ -1238,6 +1238,142 @@ Status UploadF32(const SafetensorsFile& file, const std::string& name,
     return Status::Ok();
 }
 
+// ---- single-sequence (B=1) warp-per-row GEMV fast path -------------
+// One warp per output row: shuffle reduction instead of a shared-memory
+// tree (the 7-round __syncthreads reduction dominated rows whose dot
+// product is only a handful of chunks), and the normalized activation
+// staged once per block in shared memory so the vocab-sized head stops
+// re-reading x from L2 for every row.
+constexpr int kWarpRows = 8;  // warps (= rows) per block
+
+__device__ inline float Dot8(const float* wv, const float* xs, int i0) {
+    const float4* xp = reinterpret_cast<const float4*>(xs + i0);
+    const float4 x0 = xp[0];
+    const float4 x1 = xp[1];
+    return wv[0] * x0.x + wv[1] * x0.y + wv[2] * x0.z + wv[3] * x0.w +
+           wv[4] * x1.x + wv[5] * x1.y + wv[6] * x1.z + wv[7] * x1.w;
+}
+
+__device__ inline float WarpSum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    return v;
+}
+
+template <typename W, bool Accumulate, bool FoldNorm>
+__global__ void MatVecEpi1Kernel(W w, const float* __restrict__ x,
+                                 const float* __restrict__ norm_w,
+                                 const float* __restrict__ scales,
+                                 int in_dim, int out_dim,
+                                 float* __restrict__ y) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        xs[i] = FoldNorm ? x[i] * norm_w[i] : x[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarpRows + (threadIdx.x >> 5);
+    if (row >= out_dim) return;
+    float acc = 0.0f;
+    const int chunks = in_dim >> 3;
+    for (int ci = lane; ci < chunks; ci += 32) {
+        float wv[8];
+        w.Load8(row, ci << 3, wv);
+        acc += Dot8(wv, xs, ci << 3);
+    }
+    acc = WarpSum(acc);
+    if (lane == 0) {
+        float r = acc;
+        if (FoldNorm) r *= scales[0];
+        if (Accumulate) {
+            y[row] += r;
+        } else {
+            y[row] = r;
+        }
+    }
+}
+
+template <typename W>
+__global__ void FusedGateUp1Kernel(W gate_w, W up_w,
+                                   const float* __restrict__ x,
+                                   const float* __restrict__ norm_w,
+                                   const float* __restrict__ scales,
+                                   int in_dim, float* __restrict__ out,
+                                   int inter) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        xs[i] = x[i] * norm_w[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarpRows + (threadIdx.x >> 5);
+    if (row >= inter) return;
+    float accg = 0.0f;
+    float accu = 0.0f;
+    const int chunks = in_dim >> 3;
+    for (int ci = lane; ci < chunks; ci += 32) {
+        float gw[8];
+        float uw[8];
+        gate_w.Load8(row, ci << 3, gw);
+        up_w.Load8(row, ci << 3, uw);
+        accg += Dot8(gw, xs, ci << 3);
+        accu += Dot8(uw, xs, ci << 3);
+    }
+    accg = WarpSum(accg);
+    accu = WarpSum(accu);
+    if (lane == 0) {
+        const float g = accg * scales[0];
+        const float u = accu * scales[0];
+        out[row] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+template <typename W>
+__global__ void FusedQkv1Kernel(
+    W qw, W kw, W vw, const float* __restrict__ q_bias,
+    const float* __restrict__ k_bias, const float* __restrict__ v_bias,
+    const float* __restrict__ x, const float* __restrict__ norm_w,
+    const float* __restrict__ scales, int in_dim, int q_dim, int kv_dim,
+    float* __restrict__ q_out, float* __restrict__ k_out,
+    float* __restrict__ v_out) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        xs[i] = x[i] * norm_w[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarpRows + (threadIdx.x >> 5);
+    if (row >= q_dim + 2 * kv_dim) return;
+    W w = qw;
+    const float* bias = q_bias;
+    float* dst = q_out;
+    size_t local = row;
+    if (row >= q_dim + kv_dim) {
+        w = vw;
+        bias = v_bias;
+        dst = v_out;
+        local = row - q_dim - kv_dim;
+    } else if (row >= q_dim) {
+        w = kw;
+        bias = k_bias;
+        dst = k_out;
+        local = row - q_dim;
+    }
+    float acc = 0.0f;
+    const int chunks = in_dim >> 3;
+    for (int ci = lane; ci < chunks; ci += 32) {
+        float wv[8];
+        w.Load8(local, ci << 3, wv);
+        acc += Dot8(wv, xs, ci << 3);
+    }
+    acc = WarpSum(acc);
+    if (lane == 0) {
+        dst[local] = acc * scales[0] + bias[local];
+    }
+}
+
 // Invokes fn with the correctly-typed weight accessor.
 template <typename Fn>
 void WithWeightView(const WeightBuffer& w, int in_dim, Fn&& fn) {
@@ -1315,10 +1451,21 @@ void LaunchFusedQkvB(const WeightBuffer& qw, const WeightBuffer& kw,
                 using VT = std::decay_t<decltype(vv)>;
                 if constexpr (std::is_same_v<QT, KT> &&
                               std::is_same_v<KT, VT>) {
-                    FusedQkvKernel<QT, B><<<rows, 128, 0, stream>>>(
-                        qv, kv, vv, q_bias, k_bias, v_bias, x, norm_w,
-                        scales, in_dim, q_dim, kv_dim, q_out, k_out,
-                        v_out);
+                    if constexpr (B == 1) {
+                        const int blocks =
+                            (rows + kWarpRows - 1) / kWarpRows;
+                        FusedQkv1Kernel<QT>
+                            <<<blocks, 32 * kWarpRows,
+                               size_t(in_dim) * sizeof(float), stream>>>(
+                                qv, kv, vv, q_bias, k_bias, v_bias, x,
+                                norm_w, scales, in_dim, q_dim, kv_dim,
+                                q_out, k_out, v_out);
+                    } else {
+                        FusedQkvKernel<QT, B><<<rows, 128, 0, stream>>>(
+                            qv, kv, vv, q_bias, k_bias, v_bias, x, norm_w,
+                            scales, in_dim, q_dim, kv_dim, q_out, k_out,
+                            v_out);
+                    }
                 }
             });
         });
@@ -1336,9 +1483,20 @@ void LaunchFusedGateUpB(const WeightBuffer& gate_w,
             using GT = std::decay_t<decltype(gv)>;
             using UT = std::decay_t<decltype(uv)>;
             if constexpr (std::is_same_v<GT, UT>) {
-                FusedGateUpSwigluKernel<GT, B>
-                    <<<inter, 128, 0, stream>>>(gv, uv, x, norm_w, scales,
-                                                in_dim, out, inter);
+                if constexpr (B == 1) {
+                    const int blocks =
+                        (inter + kWarpRows - 1) / kWarpRows;
+                    FusedGateUp1Kernel<GT>
+                        <<<blocks, 32 * kWarpRows,
+                           size_t(in_dim) * sizeof(float), stream>>>(
+                            gv, uv, x, norm_w, scales, in_dim, out,
+                            inter);
+                } else {
+                    FusedGateUpSwigluKernel<GT, B>
+                        <<<inter, 128, 0, stream>>>(gv, uv, x, norm_w,
+                                                    scales, in_dim, out,
+                                                    inter);
+                }
             }
         });
     });
@@ -1350,9 +1508,18 @@ void LaunchMatVecEpiB(const WeightBuffer& w, const float* x,
                       int out_dim, float* y, int ldy,
                       cudaStream_t stream) {
     WithWeightView(w, in_dim, [&](auto view) {
-        MatVecEpilogueKernel<decltype(view), B, Accumulate, FoldNorm>
-            <<<out_dim, 128, 0, stream>>>(view, x, norm_w, scales, in_dim,
-                                          y, ldy);
+        if constexpr (B == 1) {
+            const int blocks = (out_dim + kWarpRows - 1) / kWarpRows;
+            MatVecEpi1Kernel<std::decay_t<decltype(view)>, Accumulate,
+                             FoldNorm>
+                <<<blocks, 32 * kWarpRows,
+                   size_t(in_dim) * sizeof(float), stream>>>(
+                    view, x, norm_w, scales, in_dim, out_dim, y);
+        } else {
+            MatVecEpilogueKernel<decltype(view), B, Accumulate, FoldNorm>
+                <<<out_dim, 128, 0, stream>>>(view, x, norm_w, scales,
+                                              in_dim, y, ldy);
+        }
     });
 }
 
