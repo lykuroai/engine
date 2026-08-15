@@ -22,6 +22,7 @@
 #include "model/tokenizer/prompt_template.h"
 #include "observability/log.h"
 #ifdef LYKURO_HAVE_METAL
+#include "backends/metal/qwen_metal_fast.h"
 #include "backends/metal/qwen_metal_model.h"
 #endif
 #ifdef LYKURO_HAVE_CUDA
@@ -62,7 +63,8 @@ void PrintUsage() {
         "  native-engine --version | --help\n"
         "\n"
         "run options:\n"
-        "  --backend <cpu|metal|metal-fp16|cuda[:N]>  (default: best built)\n"
+        "  --backend <cpu|metal|metal-fp16|metal-fast|metal-q8|metal-q4|"
+        "cuda[:N]>  (default: best built)\n"
         "  --max-tokens <N>       (default 512)\n"
         "  --temperature <T>      (default 0 = greedy)\n"
         "  --system \"<text>\"      optional system prompt\n"
@@ -83,7 +85,7 @@ int RunGenerate(int argc, char** argv) {
 
     std::string dir, prompt, system_prompt;
 #if defined(LYKURO_HAVE_METAL)
-    std::string backend = "metal";
+    std::string backend = "metal-q4";  // fastest local default
 #elif defined(LYKURO_HAVE_CUDA)
     std::string backend = "cuda";
 #else
@@ -129,7 +131,25 @@ int RunGenerate(int argc, char** argv) {
     }
     std::unique_ptr<GenerativeModel> model = std::move(loaded.artifact.model);
 
-    if (backend == "metal" || backend == "metal-fp16") {
+    if (backend == "metal-fast" || backend == "metal-q8" ||
+        backend == "metal-q4") {
+#ifdef LYKURO_HAVE_METAL
+        MetalFastOptions fo;
+        if (backend == "metal-q8") fo.quant = MetalFastOptions::Quant::kInt8;
+        if (backend == "metal-q4") fo.quant = MetalFastOptions::Quant::kInt4;
+        auto m = QwenMetalFastModel::Load(loaded.artifact.manifest,
+                                          *loaded.artifact.weights, fo);
+        if (!m.status.ok()) {
+            std::fprintf(stderr, "metal load failed: %s\n",
+                         m.status.message().c_str());
+            return 1;
+        }
+        model = std::move(m.model);
+#else
+        std::fprintf(stderr, "no Metal in this build; try --backend cpu\n");
+        return 1;
+#endif
+    } else if (backend == "metal" || backend == "metal-fp16") {
 #ifdef LYKURO_HAVE_METAL
         MetalModelOptions mo;
         mo.fp16 = (backend == "metal-fp16");

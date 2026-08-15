@@ -9,6 +9,7 @@
 #include "model/convert/hf_convert.h"
 #include "model/tokenizer/bpe_tokenizer.h"
 #ifdef LYKURO_HAVE_METAL
+#include "backends/metal/qwen_metal_fast.h"
 #include "backends/metal/qwen_metal_model.h"
 #endif
 #ifdef LYKURO_HAVE_CUDA
@@ -20,7 +21,10 @@ namespace fs = std::filesystem;
 
 std::string DefaultBackend() {
 #if defined(LYKURO_HAVE_METAL)
-    return "metal";
+    // Fastest local default (kernel path, INT4 weight-only — same
+    // default precision class as Ollama's q4 models). `metal` remains
+    // the FP32 MPSGraph parity anchor, selectable with --backend.
+    return "metal-q4";
 #elif defined(LYKURO_HAVE_CUDA)
     return "cuda";
 #else
@@ -123,7 +127,20 @@ Status LoadSession(const std::string& dir_in, const std::string& backend_in,
     out.model = std::move(out.loaded.artifact.model);
 
     const std::string& b = out.backend;
-    if (b == "metal" || b == "metal-fp16") {
+    if (b == "metal-fast" || b == "metal-q8" || b == "metal-q4") {
+#ifdef LYKURO_HAVE_METAL
+        MetalFastOptions fo;
+        if (b == "metal-q8") fo.quant = MetalFastOptions::Quant::kInt8;
+        if (b == "metal-q4") fo.quant = MetalFastOptions::Quant::kInt4;
+        auto m = QwenMetalFastModel::Load(out.loaded.artifact.manifest,
+                                          *out.loaded.artifact.weights, fo);
+        if (!m.status.ok()) return m.status;
+        out.model = std::move(m.model);
+#else
+        return Status(ErrorCode::kInvalidRequest, "no Metal in this build",
+                      "generator");
+#endif
+    } else if (b == "metal" || b == "metal-fp16") {
 #ifdef LYKURO_HAVE_METAL
         MetalModelOptions mo;
         mo.fp16 = (b == "metal-fp16");

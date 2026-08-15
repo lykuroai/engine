@@ -221,8 +221,13 @@ FileConfigResult ParseFileConfig(std::string_view json_text,
 
     // Cross-field validation (spec §26.3 incompatible combinations).
     if (s.ok() && c.hardware_backend != "cpu" &&
-        c.hardware_backend != "cuda" && c.hardware_backend != "metal") {
-        s = Invalid("hardware backend must be cpu, cuda, or metal");
+        c.hardware_backend != "cuda" && c.hardware_backend != "metal" &&
+        c.hardware_backend != "metal-fast" &&
+        c.hardware_backend != "metal-q8" &&
+        c.hardware_backend != "metal-q4") {
+        s = Invalid(
+            "hardware backend must be cpu, cuda, metal, metal-fast, "
+            "metal-q8, or metal-q4");
     }
     if (s.ok() && c.log_level != "debug" && c.log_level != "info" &&
         c.log_level != "warn" && c.log_level != "error") {

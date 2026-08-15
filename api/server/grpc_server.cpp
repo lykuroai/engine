@@ -11,6 +11,7 @@
 #include "backends/cuda/qwen_cuda_model.h"
 #endif
 #ifdef LYKURO_HAVE_METAL
+#include "backends/metal/qwen_metal_fast.h"
 #include "backends/metal/qwen_metal_model.h"
 #endif
 
@@ -657,6 +658,25 @@ Status EngineServer::LoadModel(const std::string& artifact_dir) {
 #ifdef LYKURO_HAVE_METAL
         auto metal = QwenMetalModel::Load(loaded.artifact.manifest,
                                           *loaded.artifact.weights);
+        if (!metal.status.ok()) return metal.status;
+        serving_model = std::move(metal.model);
+#else
+        return Status(ErrorCode::kUnsupportedModel,
+                      "this build has no Metal backend", "control");
+#endif
+    } else if (config_.hardware_backend == "metal-fast" ||
+               config_.hardware_backend == "metal-q8" ||
+               config_.hardware_backend == "metal-q4") {
+#ifdef LYKURO_HAVE_METAL
+        MetalFastOptions fo;
+        if (config_.hardware_backend == "metal-q8") {
+            fo.quant = MetalFastOptions::Quant::kInt8;
+        }
+        if (config_.hardware_backend == "metal-q4") {
+            fo.quant = MetalFastOptions::Quant::kInt4;
+        }
+        auto metal = QwenMetalFastModel::Load(loaded.artifact.manifest,
+                                              *loaded.artifact.weights, fo);
         if (!metal.status.ok()) return metal.status;
         serving_model = std::move(metal.model);
 #else

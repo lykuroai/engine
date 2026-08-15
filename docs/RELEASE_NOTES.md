@@ -1,5 +1,33 @@
 # Release Notes
 
+## Unreleased
+
+### Metal kernel backend — faster than Ollama on Apple Silicon
+
+New hand-written Metal compute-kernel backend (`metal-fast` FP16,
+`metal-q8` INT8, `metal-q4` INT4 weight-only; runtime-compiled MSL, no
+MPSGraph) replacing per-token graph execution with one fused command
+buffer per token. INT8/INT4 quantization follows the CUDA backend's
+scheme; activations stay FP16 with FP32 accumulation everywhere; all
+reductions are fixed-order, so output remains bit-exact run-to-run.
+
+`metal-q4` becomes the default backend on macOS for `run` and the HTTP
+API (`metal` — the FP32 MPSGraph parity anchor — and every other
+backend remain selectable via `--backend` / `hardware.backend`, which
+now also accepts the new names in engine.json).
+
+Measured on an M4 Pro (median decode, 256-token generations, same
+client-side methodology for both engines) vs Ollama 0.32.5 q4_K_M:
+
+- Qwen2.5-0.5B: **278 tok/s, TTFT 42 ms** (Ollama: 246 tok/s, 103 ms;
+  previous engine best: 87 tok/s FP32 short-ctx)
+- Qwen2.5-1.5B: **163 tok/s, TTFT 90 ms** (Ollama: 154 tok/s, 101 ms)
+
+Parity tests (`metal_fast_parity_test`) gate the path: FP16 tracks the
+CPU reference within tolerance on a teacher-forced trajectory, the
+quantized modes within quantization tolerance, and all modes are
+deterministic across runs.
+
 ## v1.0.2 (2026-08-15)
 
 Robustness fixes for the HTTP compat API (`serve`) and its CLI clients.

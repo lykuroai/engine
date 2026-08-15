@@ -3,6 +3,7 @@ enable_language(OBJCXX)
 add_library(lykuro_backend_metal STATIC
     metal_backend.mm
     qwen_metal_model.mm
+    qwen_metal_fast.mm
 )
 set_target_properties(lykuro_backend_metal PROPERTIES
     OBJCXX_STANDARD 20)

@@ -69,11 +69,13 @@ native-engine list
 native-engine pull Qwen/Qwen2.5-0.5B-Instruct
 #   -> ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct
 
-# 2. 生成(config 不要。backend 自動: macOS=Metal / CUDA / CPU)
+# 2. 生成(config 不要。backend 自動: macOS=metal-q4 / CUDA / CPU)
 native-engine run ~/.lykuro/models/Qwen_Qwen2.5-0.5B-Instruct "日本の首都は？"
 #   対話は プロンプト省略で REPL(Ctrl-D 終了)
-#   オプション: --backend cpu|metal|metal-fp16|cuda[:N] --max-tokens N
-#              --temperature T --system "..."
+#   オプション: --backend cpu|metal|metal-fp16|metal-fast|metal-q8|metal-q4|cuda[:N]
+#              --max-tokens N --temperature T --system "..."
+#   macOS 既定は metal-q4(自前 Metal kernel + INT4 weight-only、最速)。
+#   metal は FP32 MPSGraph(正確性アンカー)、metal-fast は FP16 kernel。
 
 # 既存の HF チェックポイントを変換だけする場合
 native-engine convert <hf_dir> <out_dir>
@@ -137,7 +139,7 @@ native-engine serve --config engine.json     # 旧 `--config` も後方互換
 }
 ```
 > `mtls_required:false` は開発専用(起動時に `mtls_disabled` 警告)。
-> `artifact_path` は絶対パス推奨。`backend` は `metal`|`cuda`|`cpu`。
+> `artifact_path` は絶対パス推奨。`backend` は `metal`|`metal-fast`|`metal-q8`|`metal-q4`|`cuda`|`cpu`。
 
 **本番用**(mTLS 必須・署名モデル):
 ```json
@@ -170,7 +172,7 @@ native-engine serve --config engine.json     # 旧 `--config` も後方互換
 | | `control_identities` / `data_identities` | Control API は Manager 限定、Data API は Manager+Gateway |
 | | `trusted_signing_keys` / `allow_unsigned_dev` | どちらか無いと起動拒否(fail-closed) |
 | `model` | `artifact_path` | 起動時ロードするモデル(未設定なら Control API の LoadModel で後入れ) |
-| `hardware` | `backend` / `device_id` | `metal`\|`cuda`\|`cpu` / GPU 番号 |
+| `hardware` | `backend` / `device_id` | `metal`\|`metal-fast`\|`metal-q8`\|`metal-q4`\|`cuda`\|`cpu` / GPU 番号 |
 | `scheduler` | `max_queue` / `max_sequences` | 受付キュー長 / 同時デコード数 |
 | `generation` | `max_output_tokens` / `max_input_bytes` | 出力上限 / 入力バイト上限 |
 | `observability` | `metrics_enabled` / `metrics_port` | Prometheus 出力 |
@@ -279,10 +281,37 @@ Qwen2.5-0.5B):
   なるため**。FP16 の速度便益は帯域律速となる大 model / batched decode
   で発現する見込み。メモリ削減は即座に有効
 
-Metal 未実装項目: watermark 段階制御(warning/critical、§10.4)、
-custom Metal Kernel(本開発機に metal compiler 無し)、launchd/pkg/
-Developer ID 署名/notarization(Phase 3 — 環境なし)、Metal error
-code の proto 反映、decode の bucket 逓減対策・batched decode。
+**Phase 4 第二弾 — 自前 Metal compute kernel パス(`metal-fast` /
+`metal-q8` / `metal-q4`、macOS 既定)**: MPSGraph を使わず、runtime
+コンパイルの自前 MSL カーネル(fused RMSNorm / GEMV / RoPE /
+online-softmax attention / SwiGLU)で 1 token = 1 command buffer に
+全レイヤーを一括 encode。K/V は GEMV が cache 行へ直接出力(staging
+memcpy 排除)。weight-only 量子化は CUDA backend と同方式(INT8:
+per-row absmax / INT4: per-row per-128-group absmax、nibble packed)、
+activations は FP16・accumulate は全て FP32・logits は FP32 出力。
+全 reduction は固定順序で run-to-run bit-exact。GEMV は 1 simdgroup
+2 行担当(x ロード共有 + メモリ並列度倍増)で短い行でも帯域を出す。
+
+実測(M4 Pro 64GB、256 token 生成、median of 3、クライアント計測、
+参考値は同一手法で計測した Ollama 0.32.5 q4_K_M):
+
+| Model | backend | decode tok/s | TTFT | 参考: Ollama q4_K_M |
+|---|---|---:|---:|---:|
+| Qwen2.5-0.5B | metal-q4(既定) | **278** | **42 ms** | 246 / 103 ms |
+| Qwen2.5-0.5B | metal-q8 | 228 | 54 ms | — |
+| Qwen2.5-0.5B | metal-fast (FP16) | 158 | 84 ms | (FP16: 167) |
+| Qwen2.5-1.5B | metal-q4(既定) | **163** | **90 ms** | 154 / 101 ms |
+
+品質ゲート: FP16 kernel パスは CPU reference と teacher-forced 軌道で
+logits 一致(tiny model tol 0.05、実 checkpoint で greedy 出力一致を
+確認)、量子化パスは tolerance + run-to-run bit-exact を parity test で
+強制(`tests/metal/metal_fast_parity_test.cpp`)。
+
+Metal 未実装項目: watermark 段階制御(warning/critical、§10.4)—
+kernel パスは UM admission 未統合(MPSGraph パスは実装済み)、
+launchd/pkg/Developer ID 署名/notarization(Phase 3 — 環境なし)、
+Metal error code の proto 反映、kernel パスの multi-token prefill
+(現在は token 逐次。それでも TTFT は MPSGraph 比で短い)。
 
 ## 未実装・未検証(spec §35 に基づく明示)
 

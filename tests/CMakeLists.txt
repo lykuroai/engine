@@ -46,6 +46,7 @@ endif()
 if(LYKURO_ENABLE_METAL)
     add_executable(metal_tests
         metal/metal_parity_test.cpp
+        metal/metal_fast_parity_test.cpp
         testutil/tiny_model.cpp
         unit/tokenizer_fixture.cpp
     )
