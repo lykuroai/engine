@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v1.0.4 (2026-08-15)
 
 ### CUDA decode overhaul — ahead of Ollama on RTX 3060
 

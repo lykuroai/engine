@@ -249,7 +249,7 @@ void HandleTags(int fd) {
 
 void HandleVersion(int fd) {
     SendJson(fd, 200,
-             "{\"version\":\"1.0.3\",\"engine\":\"lykuro-native-engine\"}");
+             "{\"version\":\"1.0.4\",\"engine\":\"lykuro-native-engine\"}");
 }
 
 void HandleModels(int fd) {  // OpenAI GET /v1/models
