@@ -2438,6 +2438,10 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
         };
 
         // Capture once per bucket, then replay.
+        if (std::getenv("LYKURO_CUDA_NO_GRAPH") != nullptr) {
+            pipeline(bucket);
+            goto after_graph;
+        }
         if (impl.decode_graphs[bucket_idx][splits_idx] == nullptr) {
             if (cudaStreamBeginCapture(stream,
                                        cudaStreamCaptureModeGlobal) !=
@@ -2457,6 +2461,7 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
             }
             cudaGraphDestroy(graph);
         }
+    after_graph:
         const bool prof = std::getenv("LYKURO_CUDA_PROF") != nullptr;
         static cudaEvent_t ev0 = nullptr, ev1 = nullptr;
         if (prof && ev0 == nullptr) {
