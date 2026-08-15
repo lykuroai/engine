@@ -6,9 +6,9 @@ LYK-NIE-SD-001 v1.0 に基づく独自推論エンジン。第三者推論 Runti
 仕様: `docs/claude_code_lykuro_native_inference_engine_complete_spec_v1_0.md`
 Phase 0 報告: `docs/phase0-report.md`
 
-## ダウンロード / インストール (v1.0.1)
+## ダウンロード / インストール (v1.0.2)
 
-[Releases](https://github.com/lykuroai/engine/releases/tag/v1.0.1) に
+[Releases](https://github.com/lykuroai/engine/releases/tag/v1.0.2) に
 単一自己完結バイナリ(static gRPC/protobuf/abseil)を公開:
 
 | ファイル | プラットフォーム | バックエンド |

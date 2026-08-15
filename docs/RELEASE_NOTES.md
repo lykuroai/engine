@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.0.2 (2026-08-15)
+
+Robustness fixes for the HTTP compat API (`serve`) and its CLI clients.
+
+- The server now ignores SIGPIPE, so a client aborting a stream can no
+  longer kill the process.
+- Generation stops as soon as a streaming client disconnects instead of
+  running the request to completion.
+- The CLI accepts the model names that `/v1/models` and `/api/tags`
+  report, so listed names can be passed back to `run`/`generate` as-is.
+
 ## v1.0.1 (2026-08-12)
 
 - `GET /api/version` now identifies the engine: the response gains an
