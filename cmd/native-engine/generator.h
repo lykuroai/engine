@@ -17,6 +17,11 @@ namespace lykuro::nie::cli {
 // --- model resolution (single-command / auto-pull) ---
 bool LooksLikeHfRepo(const std::string& s);
 std::string DefaultModelDir(const std::string& repo);
+
+// Canonical user-facing name for a local artifact directory (the HF
+// repo id it came from). Guaranteed to resolve back to `dir` via
+// DefaultModelDir, so it is always valid run/pull input.
+std::string DisplayModelName(const std::string& dir);
 // Download an HF checkpoint via curl + native convert into `out`. 0 on ok.
 int PullModel(const std::string& repo, const std::string& out);
 // Resolve a model arg to a local artifact dir; a HF repo id auto-pulls if

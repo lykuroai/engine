@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 
 #include "core/generation/sampler.h"
 #include "model/convert/hf_convert.h"
@@ -47,6 +48,30 @@ std::string DefaultModelDir(const std::string& repo) {
     for (char& ch : name)
         if (ch == '/') ch = '_';
     return (home ? std::string(home) : ".") + "/.lykuro/models/" + name;
+}
+
+std::string DisplayModelName(const std::string& dir) {
+    // The canonical user-facing name: the HF repo id the artifact came
+    // from (recorded by pull in a `source_repo` sidecar), falling back
+    // to deriving it from the directory name — HF owner names cannot
+    // contain '_', so the first '_' is the '/' the pull replaced. Every
+    // name this returns round-trips through DefaultModelDir back to the
+    // same directory, so list/tags output is always valid pull/run
+    // input.
+    const fs::path p(dir);
+    std::ifstream f(p / "source_repo");
+    std::string repo;
+    if (f && std::getline(f, repo) && !repo.empty() &&
+        DefaultModelDir(repo) ==
+            DefaultModelDir(p.filename().string())) {
+        return repo;
+    }
+    std::string name = p.filename().string();
+    const size_t us = name.find('_');
+    if (us != std::string::npos && us > 0 && us + 1 < name.size()) {
+        name[us] = '/';
+    }
+    return name;
 }
 
 int PullModel(const std::string& repo, const std::string& out) {
@@ -98,6 +123,9 @@ int PullModel(const std::string& repo, const std::string& out) {
         return 1;
     }
     fs::remove_all(tmp, ec);
+    // Record the source repo id so `list` / the HTTP tag endpoints can
+    // report exactly the name pull was given.
+    std::ofstream(fs::path(out) / "source_repo") << repo << "\n";
     return 0;
 }
 

@@ -237,7 +237,8 @@ void HandleTags(int fd) {
             if (!fs::exists(e.path() / "manifest.json")) continue;
             if (!first) out += ",";
             first = false;
-            std::string nm = e.path().filename().string();
+            const std::string nm =
+                cli::DisplayModelName(e.path().string());
             out += "{\"name\":\"" + JsonEsc(nm) + "\",\"model\":\"" +
                    JsonEsc(nm) + "\",\"modified_at\":\"" + NowIso() +
                    "\",\"size\":0}";
@@ -265,7 +266,8 @@ void HandleModels(int fd) {  // OpenAI GET /v1/models
                 continue;
             if (!first) out += ",";
             first = false;
-            std::string nm = e.path().filename().string();
+            const std::string nm =
+                cli::DisplayModelName(e.path().string());
             out += "{\"id\":\"" + JsonEsc(nm) +
                    "\",\"object\":\"model\",\"owned_by\":\"lykuro\"}";
         }

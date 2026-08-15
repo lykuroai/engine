@@ -342,7 +342,9 @@ int RunList(int /*argc*/, char** /*argv*/) {
                 std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tmv);
             }
             std::printf("%-44s %10s  %s\n",
-                        e.path().filename().string().c_str(),
+                        lykuro::nie::cli::DisplayModelName(
+                            e.path().string())
+                            .c_str(),
                         human(sz).c_str(), when);
             ++n;
         }
