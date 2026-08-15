@@ -2437,12 +2437,11 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
                     int(c.vocab_size));
         };
 
-        // Capture once per bucket, then replay.
-        if (std::getenv("LYKURO_CUDA_NO_GRAPH") != nullptr) {
-            pipeline(bucket);
-            goto after_graph;
-        }
-        if (impl.decode_graphs[bucket_idx][splits_idx] == nullptr) {
+        // Capture once per bucket, then replay (or launch directly for
+        // kernel-level profiling).
+        const bool no_graph = std::getenv("LYKURO_CUDA_NO_GRAPH") != nullptr;
+        if (!no_graph &&
+            impl.decode_graphs[bucket_idx][splits_idx] == nullptr) {
             if (cudaStreamBeginCapture(stream,
                                        cudaStreamCaptureModeGlobal) !=
                 cudaSuccess) {
@@ -2461,7 +2460,6 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
             }
             cudaGraphDestroy(graph);
         }
-    after_graph:
         const bool prof = std::getenv("LYKURO_CUDA_PROF") != nullptr;
         static cudaEvent_t ev0 = nullptr, ev1 = nullptr;
         if (prof && ev0 == nullptr) {
@@ -2469,10 +2467,14 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
             cudaEventCreate(&ev1);
         }
         if (prof) cudaEventRecord(ev0, stream);
-        LYKURO_CUDA_CHECK(
-            cudaGraphLaunch(impl.decode_graphs[bucket_idx][splits_idx],
-                            stream),
-            "graph launch failed");
+        if (no_graph) {
+            pipeline(bucket);
+        } else {
+            LYKURO_CUDA_CHECK(
+                cudaGraphLaunch(impl.decode_graphs[bucket_idx][splits_idx],
+                                stream),
+                "graph launch failed");
+        }
         if (prof) cudaEventRecord(ev1, stream);
 
         std::vector<float> host_logits(size_t(b) * c.vocab_size);
