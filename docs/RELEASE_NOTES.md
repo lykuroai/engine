@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.0.6 (2026-08-15)
+
+First-request latency and download integrity:
+
+- Model load 16.9s -> 3.0s for Qwen2.5-1.5B on an M4 Pro (43.9s -> ~18s
+  on the Linux/CUDA host): the CPU reference build + CPU smoke forward
+  are skipped when a GPU backend serves (its pre-warm is the smoke
+  inference), Metal/CUDA weight conversion+quantization+upload runs on
+  a thread pool, and the in-tree SHA-256 gains hardware compression
+  (ARMv8 SHA2 / x86 SHA-NI with runtime dispatch) for multi-GB artifact
+  digest verification. LYKURO_LOAD_PROF=1 prints the phase breakdown.
+- `pull` now verifies every downloaded file against Hugging Face's
+  upstream SHA-256 (x-linked-etag) before conversion. A silently
+  corrupted download previously produced an artifact that generated
+  garbage yet passed load-time checks, because the artifact's own
+  checksums are derived from the downloaded bytes.
+
 ## v1.0.5 (2026-08-15)
 
 Model-name consistency across every surface:
