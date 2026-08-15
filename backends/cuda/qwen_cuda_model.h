@@ -67,6 +67,13 @@ public:
                   std::vector<float>& logits) override;
     // Batched decode: one GPU pass for up to 16 sequences per group,
     // amortizing weight reads across sequences.
+    // Greedy fast path: N decode steps as back-to-back CUDA graph
+    // replays with on-GPU argmax feeding the next step's embedding
+    // gather (one host round trip per run).
+    bool SupportsGreedyRun() const override;
+    Status GreedyRun(SequenceState& state, uint32_t token, uint32_t max_new,
+                     std::vector<uint32_t>& out_tokens) override;
+
     Status DecodeBatch(std::vector<DecodeBatchItem>& items,
                        std::vector<Status>& per_item) override;
 

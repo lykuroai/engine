@@ -343,6 +343,7 @@ __global__ void CombineAttentionKernel(const float* __restrict__ partials,
 // ---- batched decode kernels ----
 
 constexpr int kMaxBatch = 16;
+constexpr uint32_t kGreedyRun = 16;  // greedy decode steps per host sync
 
 __global__ void RopeVarPosKernel(float* __restrict__ buf, int row_stride,
                                  int head_dim,
@@ -1374,6 +1375,86 @@ __global__ void FusedQkv1Kernel(
     }
 }
 
+// ---- greedy-run support: on-GPU argmax between graph replays --------
+// The greedy decode graph ends with a two-stage argmax that feeds the
+// winning token id straight back into the token slot the next replay's
+// embedding gather reads, records it, and advances the device-side
+// position — so N tokens run as N back-to-back graph launches with no
+// host round trip. The rule matches Sampler's greedy exactly: maximum
+// value, ties resolved to the lowest index (NaN never wins a compare;
+// the run-final finite scan reports poisoned logits).
+__global__ void ArgmaxStage1Kernel(const float* __restrict__ logits,
+                                   int n, float* __restrict__ pm,
+                                   int* __restrict__ pidx) {
+    __shared__ float bv[256];
+    __shared__ int bi[256];
+    const int chunk = (n + gridDim.x - 1) / gridDim.x;
+    const int start = blockIdx.x * chunk;
+    const int end = min(start + chunk, n);
+    float best = -INFINITY;
+    int besti = 0x7FFFFFFF;
+    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+        const float v = logits[i];
+        if (v > best || (v == best && i < besti)) {
+            best = v;
+            besti = i;
+        }
+    }
+    bv[threadIdx.x] = best;
+    bi[threadIdx.x] = besti;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            const bool take =
+                bv[threadIdx.x + s] > bv[threadIdx.x] ||
+                (bv[threadIdx.x + s] == bv[threadIdx.x] &&
+                 bi[threadIdx.x + s] < bi[threadIdx.x]);
+            if (take) {
+                bv[threadIdx.x] = bv[threadIdx.x + s];
+                bi[threadIdx.x] = bi[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        pm[blockIdx.x] = bv[0];
+        pidx[blockIdx.x] = bi[0];
+    }
+}
+
+__global__ void ArgmaxStage2Kernel(const float* __restrict__ pm,
+                                   const int* __restrict__ pidx,
+                                   uint32_t* __restrict__ token_slot,
+                                   uint32_t* __restrict__ positions,
+                                   uint32_t* __restrict__ out_tokens,
+                                   uint32_t* __restrict__ step) {
+    __shared__ float bv[256];
+    __shared__ int bi[256];
+    bv[threadIdx.x] = pm[threadIdx.x];
+    bi[threadIdx.x] = pidx[threadIdx.x];
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            const bool take =
+                bv[threadIdx.x + s] > bv[threadIdx.x] ||
+                (bv[threadIdx.x + s] == bv[threadIdx.x] &&
+                 bi[threadIdx.x + s] < bi[threadIdx.x]);
+            if (take) {
+                bv[threadIdx.x] = bv[threadIdx.x + s];
+                bi[threadIdx.x] = bi[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const uint32_t tok = uint32_t(bi[0]);
+        token_slot[0] = tok;
+        out_tokens[*step] = tok;
+        ++*step;
+        ++positions[0];
+    }
+}
+
 // Invokes fn with the correctly-typed weight accessor.
 template <typename Fn>
 void WithWeightView(const WeightBuffer& w, int in_dim, Fn&& fn) {
@@ -1713,10 +1794,19 @@ struct QwenCudaModel::Impl {
     cudaStream_t stream = nullptr;
     // Keyed by (batch bucket {1,2,4,8,16}, splits bucket {1,8,32}).
     cudaGraphExec_t decode_graphs[5][3] = {};
+    // Greedy-run graphs (decode + on-GPU argmax), keyed by splits bucket.
+    cudaGraphExec_t greedy_graphs[3] = {};
+    DeviceBuffer am_val;      // float[256] argmax partial values
+    DeviceBuffer am_idx;      // int[256] argmax partial indices
+    DeviceBuffer d_out_tokens;  // uint32[kGreedyRun]
+    DeviceBuffer d_step;        // uint32[1]
     DeviceBuffer pad_table;  // int[1]: reserved scratch block id
     int scratch_block = -1;  // sink for padding-row KV writes
 
     ~Impl() {
+        for (cudaGraphExec_t g : greedy_graphs) {
+            if (g != nullptr) cudaGraphExecDestroy(g);
+        }
         for (auto& row : decode_graphs) {
             for (cudaGraphExec_t g : row) {
                 if (g != nullptr) cudaGraphExecDestroy(g);
@@ -2050,6 +2140,13 @@ QwenCudaModel::LoadResult QwenCudaModel::Load(
         if (s.ok()) {
             s = impl.d_norm_scales.AllocBytes(kMaxBatch * sizeof(float));
         }
+        if (s.ok()) s = impl.am_val.AllocBytes(256 * sizeof(float));
+        if (s.ok()) s = impl.am_idx.AllocBytes(256 * sizeof(int));
+        if (s.ok()) {
+            s = impl.d_out_tokens.AllocBytes(kGreedyRun *
+                                             sizeof(uint32_t));
+        }
+        if (s.ok()) s = impl.d_step.AllocBytes(sizeof(uint32_t));
         if (s.ok()) {
             s = impl.d_seq_tables.AllocBytes(kMaxBatch * sizeof(int*));
         }
@@ -2472,6 +2569,147 @@ Status QwenCudaModel::Decode(SequenceState& state, uint32_t token,
     Status s = ForwardToken(token, seq.length(), &seq, logits, true);
     if (!s.ok()) return s;
     seq.Advance();
+    return Status::Ok();
+}
+
+bool QwenCudaModel::SupportsGreedyRun() const {
+    return impl_->chunked_prefill;
+}
+
+Status QwenCudaModel::GreedyRun(SequenceState& state, uint32_t token,
+                                uint32_t max_new,
+                                std::vector<uint32_t>& out_tokens) {
+    auto& seq = static_cast<CudaSequenceState&>(state);
+    out_tokens.clear();
+    Impl& impl = *impl_;
+    const QwenConfig& c = config_;
+    if (!impl.chunked_prefill) {
+        return Status(ErrorCode::kInternalError, "greedy run unsupported",
+                      kComponent);
+    }
+    if (token >= c.vocab_size) {
+        return Status(ErrorCode::kInvalidRequest,
+                      "token id out of vocab range", kComponent);
+    }
+    if (max_new == 0) {
+        return Status(ErrorCode::kInvalidRequest, "max_new must be > 0",
+                      kComponent);
+    }
+    if (seq.length() >= seq.capacity()) {
+        return Status(ErrorCode::kContextLengthExceeded,
+                      "kv cache capacity exhausted", kComponent);
+    }
+    LYKURO_CUDA_CHECK(cudaSetDevice(device_id_), "cuda device not usable");
+    const uint32_t len = seq.length();
+    const uint32_t nsteps = std::min(
+        {max_new, kGreedyRun, seq.capacity() - len});
+    Status cap = seq.EnsureCapacity(len + nsteps - 1);
+    if (!cap.ok()) return cap;
+
+    cudaStream_t stream = impl.stream;
+    const uint32_t pos0 = len;
+    const uint32_t zero = 0;
+    const int* table = seq.device_table();
+    LYKURO_CUDA_CHECK(
+        cudaMemcpyAsync(impl.d_tokens.ptr, &token, sizeof(uint32_t),
+                        cudaMemcpyHostToDevice, stream),
+        "token upload failed");
+    LYKURO_CUDA_CHECK(
+        cudaMemcpyAsync(impl.d_positions.ptr, &pos0, sizeof(uint32_t),
+                        cudaMemcpyHostToDevice, stream),
+        "position upload failed");
+    LYKURO_CUDA_CHECK(
+        cudaMemcpyAsync(impl.d_step.ptr, &zero, sizeof(uint32_t),
+                        cudaMemcpyHostToDevice, stream),
+        "step reset failed");
+    LYKURO_CUDA_CHECK(
+        cudaMemcpyAsync(impl.d_seq_tables.ptr, &table,
+                        sizeof(const int*), cudaMemcpyHostToDevice,
+                        stream),
+        "table pointer upload failed");
+
+    // Splits bucket sized for the END of the run so the fixed grid
+    // covers every step.
+    const uint32_t max_context = len + nsteps;
+    int splits_idx;
+    int splits;
+    if (max_context <= 128) {
+        splits_idx = 0;
+        splits = 1;
+    } else if (max_context <= 1024) {
+        splits_idx = 1;
+        splits = 8;
+    } else {
+        splits_idx = 2;
+        splits = kMaxSplits;
+    }
+
+    auto* positions_dev = static_cast<const uint32_t*>(impl.d_positions.ptr);
+    auto* tables_dev = static_cast<const int* const*>(impl.d_seq_tables.ptr);
+    auto greedy_pipeline = [&]() {
+        RunFusedDecode<1>(impl, c, positions_dev, tables_dev, splits,
+                          stream);
+        ArgmaxStage1Kernel<<<256, 256, 0, stream>>>(
+            impl.batch_logits.f32(), int(c.vocab_size), impl.am_val.f32(),
+            impl.am_idx.i32());
+        ArgmaxStage2Kernel<<<1, 256, 0, stream>>>(
+            impl.am_val.f32(), impl.am_idx.i32(),
+            static_cast<uint32_t*>(impl.d_tokens.ptr),
+            static_cast<uint32_t*>(impl.d_positions.ptr),
+            static_cast<uint32_t*>(impl.d_out_tokens.ptr),
+            static_cast<uint32_t*>(impl.d_step.ptr));
+    };
+    if (impl.greedy_graphs[splits_idx] == nullptr) {
+        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) !=
+            cudaSuccess) {
+            return Status(ErrorCode::kGpuUnhealthy, "graph capture failed",
+                          kComponent);
+        }
+        greedy_pipeline();
+        cudaGraph_t graph = nullptr;
+        if (cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
+            cudaGraphInstantiate(&impl.greedy_graphs[splits_idx], graph,
+                                 nullptr, nullptr, 0) != cudaSuccess) {
+            if (graph != nullptr) cudaGraphDestroy(graph);
+            return Status(ErrorCode::kGpuUnhealthy,
+                          "graph instantiation failed", kComponent);
+        }
+        cudaGraphDestroy(graph);
+    }
+    for (uint32_t s = 0; s < nsteps; ++s) {
+        LYKURO_CUDA_CHECK(
+            cudaGraphLaunch(impl.greedy_graphs[splits_idx], stream),
+            "graph launch failed");
+    }
+    std::vector<uint32_t> toks(nsteps);
+    std::vector<float> logits(c.vocab_size);
+    LYKURO_CUDA_CHECK(
+        cudaMemcpyAsync(toks.data(), impl.d_out_tokens.ptr,
+                        nsteps * sizeof(uint32_t), cudaMemcpyDeviceToHost,
+                        stream),
+        "token download failed");
+    LYKURO_CUDA_CHECK(
+        cudaMemcpyAsync(logits.data(), impl.batch_logits.ptr,
+                        logits.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream),
+        "logits download failed");
+    LYKURO_CUDA_CHECK(cudaStreamSynchronize(stream),
+                      "device execution failed");
+    LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
+    // Run-granular non-finite gate: a NaN propagates through the KV
+    // chain into these final logits.
+    const uint32_t* bits =
+        reinterpret_cast<const uint32_t*>(logits.data());
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < c.vocab_size; ++i) {
+        bad |= uint32_t((bits[i] & 0x7f800000u) == 0x7f800000u);
+    }
+    if (bad != 0) {
+        return Status(ErrorCode::kInferenceFailed,
+                      "logits contain non-finite values", kComponent);
+    }
+    out_tokens.assign(toks.begin(), toks.end());
+    for (uint32_t s = 0; s < nsteps; ++s) seq.Advance();
     return Status::Ok();
 }
 
