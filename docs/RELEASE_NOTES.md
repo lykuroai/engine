@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v1.0.3 (2026-08-15)
 
 ### Metal kernel backend — faster than Ollama on Apple Silicon
 
