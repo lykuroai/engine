@@ -4,7 +4,7 @@
 |---|---|
 | 文書番号 | LYK-NIE-SD-001 |
 | 版 | v1.1 Claude Code Edition |
-| 制定日 | 2026-08-07(改訂 2026-08-12) |
+| 制定日 | 2026-08-07(改訂 2026-08-15) |
 | 作成 | 株式会社eビジネスソリューション / Lykuro.ai |
 | Project | lykuro-native-inference-engine |
 | 対象 | Native Inference Engine本体、Model Architecture Plugin、GPU Backend |
@@ -528,6 +528,29 @@ eventはrequest_id、monotonic sequence、timestampを持つ。
 
 clientはOllama本家と本engineを `engine` fieldの有無で判別できる。`version` はengine本体のrelease versionと一致する。
 
+**Model名の正準形(v1.0.5)**: 一覧surface(`native-engine list`、
+`GET /api/tags`、`GET /v1/models`)はHF repo id形式
+(`Qwen/Qwen2.5-0.5B-Instruct`)を報告する。`pull` は変換完了時に
+repo idを artifact 内の `source_repo` sidecarへ記録し、一覧はこれを
+表示する。sidecarが無い既存artifactはdirectory名から導出する(HFの
+owner名は `_` を含めない仕様のため、最初の `_` が置換された `/` と
+一意に判る)。表示名は「同一artifactへ解決し返せる場合のみ」採用する
+(round-trip保証)。入力側はrepo id形式・directory名形式
+(`Qwen_Qwen2.5-0.5B-Instruct`)の両方を全surfaceで受理する。
+
+**pull冪等性(v1.0.5)**: 既にローカルに存在するmodelへの `pull`
+(CLI / `POST /api/pull`)はnetworkに出ずno-op成功を返す(Ollama互換
+挙動)。未知名がrepo id形式でない場合は「not a valid HF repo id」を
+明示してfailする。
+
+**切断堅牢性(v1.0.2)**: serverはSIGPIPEを無視し、streaming中の
+client切断はprocessを殺さない。切断検知時は当該requestの生成を即座に
+停止する。
+
+**backend選択**: `serve [--backend <name>]` で全modelのbackendを指定
+できる(§17.6の名称)。未指定時はbuildに応じた既定
+(macOS: `metal-q4`、Linux+CUDA: `cuda`、その他: `cpu`)。
+
 ---
 
 ## 10. Model Artifact・Manifest
@@ -828,6 +851,38 @@ input_tokens
 | error | Engine failure |
 | content_filter | 将来のlocal output filter |
 
+### 14.5 Greedy Fast Path(GreedyRun、v1.0.4)
+
+`GenerativeModel` はoptionalなgreedy高速pathを提供できる:
+
+~~~cpp
+virtual bool SupportsGreedyRun() const;  // 既定 false
+virtual Status GreedyRun(SequenceState&, uint32_t token,
+                         uint32_t max_new,
+                         std::vector<uint32_t>& out_tokens);
+~~~
+
+契約:
+
+- samplingは**greedy規則そのもの**(argmax、同値は最小index)。CPU側
+  `Sampler` のgreedyとbit一致することをparity testで強制する。
+- backendは複数stepをdevice上で連続実行してよい(Metal: 最大16 stepを
+  1 command bufferに投機encodeし、on-GPU argmax + embedding gatherで
+  接続。次batchを常時1本先行commitする。CUDA: decode graphの末尾に
+  2-stage argmaxを接続し、graphを連続replayする)。
+- 返却token数は要求 `max_new` を**上限としない場合がある**(投機済み
+  batchの回収)。callerはEOS/上限で打ち切り、超過分を破棄する。破棄
+  されたKV行は「読まれる前に必ず書き直される」ため巻き戻し不要。
+- 非有限logits検知は**run粒度**で保証する(NaNはKV連鎖を通じて最終
+  logitsへ伝播するため、最終logitsのscanで検出できる)。per-token
+  保証が必要な場合は従来の `Decode` を使う。
+- temperature > 0 の生成はこのpathを使わず、従来の
+  `Decode` + host samplerで行う。
+- 呼び出し系列の分岐(投機と異なるtokenでの継続)・他sequenceの介在は
+  backendが安全にflushする(共有buffer汚染禁止。再利用されない
+  sequence idで stale回収を防ぐ)。
+- 決定性: 全reductionは固定順序で、出力はrun-to-run bit-exact。
+
 ---
 
 ## 15. Scheduler・Admission
@@ -1007,7 +1062,8 @@ MVPは明示device IDを必須とする。自動的に全GPUを使用しない�
 
 ~~~yaml
 hardware:
-  backend: cuda
+  backend: cuda   # §17.6の実装名(cpu|metal|metal-fast|metal-q8|
+                  # metal-q4|cuda|cuda-q8|cuda-q4 等)
   device_ids: [0]
   vram_reserve_mb: 2048
 ~~~
@@ -1035,6 +1091,34 @@ OOM後にsilent continuationしない。
 - partial rank failure
 
 MVP contractへ未実装flagを明記する。
+
+---
+
+### 17.6 Backend実装名と量子化モード(v1.0.3〜v1.0.4)
+
+CLI/HTTP(`--backend`)およびengine.json(`hardware.backend`)で選択
+する実装名:
+
+| 名称 | 実装 | 精度 |
+|---|---|---|
+| `cpu` | CPU reference(正確性oracle) | FP32 |
+| `metal` | MPSGraph(parity anchor) | FP32 |
+| `metal-fp16` | MPSGraph | FP16 storage / FP32 accumulate |
+| `metal-fast` | 自前MSL kernel path | FP16 |
+| `metal-q8` | 自前MSL kernel path | INT8 weight-only |
+| `metal-q4` | 自前MSL kernel path(macOS既定) | INT4 weight-only |
+| `cuda[:N]` | CUDA(device N) | checkpoint dtype(BF16) |
+| `cuda-q8[:N]` | CUDA | INT8 weight-only |
+| `cuda-q4[:N]` | CUDA | INT4 weight-only |
+
+量子化はload時のweight-only変換(INT8: per-output-row absmax、
+INT4: per-row per-128-group absmax、nibble packed)。activationsは
+FP16(Metal)/FP32(CUDA)、accumulateは常にFP32、logitsはFP32出力。
+量子化modeではlm headも量子化するが、embedding tableはlookup品質の
+ためcheckpoint dtypeを保持する。全modeで出力はrun-to-run bit-exact
+(固定順序reduction)。品質はCPU referenceとのparity test
+(FP16: tolerance + 実checkpoint greedy一致、量子化: 量子化tolerance)
+でgateする。
 
 ---
 
@@ -1952,3 +2036,4 @@ GPU、driver、model artifact、署名鍵、Kubernetes等がなく検証でき�
 |---|---|---|
 | v1.0 | 2026-08-07 | Native Engineの独立project、API、model plugin、推論、scheduler、memory、GPU、security、testを完全定義 |
 | v1.1 | 2026-08-12 | §9.8 HTTP互換API(Ollama / OpenAI)を追加。`GET /api/version` の `engine` field(engine実装識別、release v1.0.1)を規定 |
+| v1.2 | 2026-08-15 | §17.6 backend実装名と量子化モード(metal-fast/q8/q4・cuda-q8/q4、release v1.0.3〜v1.0.4)、§14.5 Greedy Fast Path(GreedyRun契約、v1.0.4)、§9.8にmodel名正準形・pull冪等性(v1.0.5)と切断堅牢性(v1.0.2)を追記 |

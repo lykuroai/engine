@@ -1551,3 +1551,4 @@ Appleおよびdependency仕様は変更されるため、releaseごとに公式�
 | 版 | 日付 | 内容 |
 |---|---|---|
 | v1.0 | 2026-08-08 | Apple Silicon、Metal Backend、Unified Memory、macOS native package、実機test、M4 64GB Certified Profileを追加 |
+| v1.1 | 2026-08-15 | 性能path追記(本体仕様v1.2 §17.6/§14.5参照): MPSGraphに加え自前MSL kernel backend(metal-fast/q8/q4、runtimeコンパイル・1 token=1 command buffer・split-row flash-decoding attention・INT8/INT4 weight-only)、greedy投機pipeline(on-GPU argmax + embedding gather、二重command buffer先行commit)。macOS既定backendはmetal-q4。M4 Pro実測: Qwen2.5-0.5B 485 tok/s / 1.5B 210 tok/s(release v1.0.3〜v1.0.4) |
