@@ -7,6 +7,8 @@
 #include <type_traits>
 #include <typeinfo>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -2455,10 +2457,18 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
             }
             cudaGraphDestroy(graph);
         }
+        const bool prof = std::getenv("LYKURO_CUDA_PROF") != nullptr;
+        static cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+        if (prof && ev0 == nullptr) {
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+        }
+        if (prof) cudaEventRecord(ev0, stream);
         LYKURO_CUDA_CHECK(
             cudaGraphLaunch(impl.decode_graphs[bucket_idx][splits_idx],
                             stream),
             "graph launch failed");
+        if (prof) cudaEventRecord(ev1, stream);
 
         std::vector<float> host_logits(size_t(b) * c.vocab_size);
         LYKURO_CUDA_CHECK(
@@ -2469,6 +2479,17 @@ Status QwenCudaModel::DecodeBatch(std::vector<DecodeBatchItem>& items,
         LYKURO_CUDA_CHECK(cudaStreamSynchronize(stream),
                           "device execution failed");
         LYKURO_CUDA_CHECK(cudaGetLastError(), "kernel launch failed");
+        if (prof) {
+            static double gpu_ms = 0;
+            static int n = 0;
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, ev0, ev1);
+            gpu_ms += ms;
+            if (++n % 128 == 0) {
+                std::fprintf(stderr, "[prof] cuda graph %.2fms/tok\n",
+                             gpu_ms / n);
+            }
+        }
 
         for (uint32_t i = 0; i < b; ++i) {
             const size_t item_idx = valid[group_start + i];
