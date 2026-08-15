@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### CUDA decode overhaul — ahead of Ollama on RTX 3060
+
+- Vectorized 8-wide weight loads (per-element nibble reads were an 8x
+  DRAM amplification that left cuda-q4 no faster than BF16), warp-per-
+  row B=1 GEMV kernels with shared-memory-staged activations, and a
+  quantized lm head in the quantized modes (the BF16 head read was the
+  single largest decode cost).
+- GreedyRun ported to CUDA: up to 16 back-to-back decode-graph replays
+  with a two-stage on-GPU argmax feeding the next replay's embedding
+  gather — one host round trip per run instead of per token.
+- The CLI/HTTP surface gains cuda-q8[:N] / cuda-q4[:N] (the backend's
+  INT8/INT4 weight-only quantization was previously unreachable).
+- RTX 3060, 256-token generations, host-local client measurement, vs
+  Ollama 0.21.0 q4_K_M:
+  Qwen2.5-0.5B: 434 tok/s, TTFT 45 ms  (Ollama 246 / 116 ms; was 140)
+  Qwen2.5-1.5B: 183 tok/s, TTFT 140 ms (Ollama 152 / 119 ms; was 66)
+
 ### Greedy GPU pipeline + split-row attention — ahead of MLX on 0.5B
 
 - Greedy decoding now runs up to 16 speculative steps per command
